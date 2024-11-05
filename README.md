@@ -21,7 +21,7 @@ A collection of utility nodes for ComfyUI that provide additional functionality 
 
 2. Clone this repository:
    ```bash
-   git clone https://github.com/YourUsername/HommageTools.git
+   git clone https://github.com/ArtHommage/HommageTools.git
    ```
 
 3. Install requirements:
