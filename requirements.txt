@@ -1,0 +1,4 @@
+torch>=2.0.0
+numpy>=1.21.0
+Pillow>=9.0.0
+psd-tools>=1.9.24
