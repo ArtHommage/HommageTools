@@ -1,152 +1,146 @@
 """
 File: ComfyUI-HommageTools/__init__.py
+Version: 1.0.1
+Description: Entry point for HommageTools node collection for ComfyUI.
+             Handles node registration, imports, and logging configuration.
+             Enhanced with detailed debugging output.
 
-HommageTools Node Collection for ComfyUI
-Version: 1.0.0
-Description: A collection of utility nodes for ComfyUI
+Sections:
+1. Module Configuration
+2. Node Imports
+3. Node Registration
+4. Package Exports
 """
 
+#------------------------------------------------------------------------------
+# Section 1: Module Configuration
+#------------------------------------------------------------------------------
 import logging
+import sys
+from pathlib import Path
+import traceback
 
-# Configure logging (adjust level as needed)
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Configure logging with more detailed format
+logging.basicConfig(
+    level=logging.DEBUG,  # Changed to DEBUG level
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    handlers=[
+        logging.FileHandler('homage_tools_debug.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('HommageTools')
+logger.debug("Initializing HommageTools...")
 
-logger.debug("Entering __init__.py")
+# Add nodes directory to Python path
+NODES_DIR = Path(__file__).parent / "nodes"
+logger.debug(f"Checking nodes directory: {NODES_DIR}")
 
-try:
-    logger.debug("Importing ht_regex_node")
-    from .nodes.ht_regex_node import HTRegexNode
-    logger.debug("Imported ht_regex_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_regex_node: {e}")
-    raise  # Re-raise the exception after logging
+if not NODES_DIR.exists():
+    logger.error(f"Nodes directory not found at {NODES_DIR}")
+    raise FileNotFoundError(f"Nodes directory not found at {NODES_DIR}")
 
-try:
-    logger.debug("Importing ht_resize_node")
-    from .nodes.ht_resize_node import HTResizeNode
-    logger.debug("Imported ht_resize_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_resize_node: {e}")
-    raise
+logger.debug(f"Found nodes directory. Contents: {[f.name for f in NODES_DIR.iterdir() if f.is_file()]}")
 
-try:
-    logger.debug("Importing ht_resolution_node")
-    from .nodes.ht_resolution_node import HTResolutionNode
-    logger.debug("Imported ht_resolution_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_resolution_node: {e}")
-    raise
+#------------------------------------------------------------------------------
+# Section 2: Node Imports
+#------------------------------------------------------------------------------
+# Dictionary to track successful imports
+imported_nodes = {}
 
-try:
-    logger.debug("Importing ht_conversion_node")
-    from .nodes.ht_conversion_node import HTConversionNode
-    logger.debug("Imported ht_conversion_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_conversion_node: {e}")
-    raise
+def import_node(node_name, import_path):
+    """Helper function to import nodes with detailed error tracking"""
+    logger.debug(f"Attempting to import {node_name} from {import_path}")
+    try:
+        module_path = f".nodes.{import_path}"
+        module = __import__(module_path, fromlist=['*'], globals=globals())
+        node_class = getattr(module, node_name)
+        imported_nodes[node_name] = node_class
+        logger.debug(f"Successfully imported {node_name}")
+        return True
+    except ImportError as e:
+        logger.error(f"ImportError while loading {node_name}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
+    except AttributeError as e:
+        logger.error(f"AttributeError while loading {node_name}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error while loading {node_name}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
 
-try:
-    logger.debug("Importing ht_switch_node")
-    from .nodes.ht_switch_node import HTSwitchNode
-    logger.debug("Imported ht_switch_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_switch_node: {e}")
-    raise
+logger.debug("Starting node imports...")
 
-try:
-    logger.debug("Importing ht_parameter_extractor")
-    from .nodes.ht_parameter_extractor import HTParameterExtractorNode
-    logger.debug("Imported ht_parameter_extractor")
-except ImportError as e:
-    logger.exception(f"Error importing ht_parameter_extractor: {e}")
-    raise
+# Text Processing Nodes
+import_node("HTRegexNode", "ht_regex_node")
+import_node("HTParameterExtractorNode", "ht_parameter_extractor")
+import_node("HTTextCleanupNode", "ht_text_cleanup_node")
 
-try:
-    logger.debug("Importing ht_text_cleanup_node")
-    from .nodes.ht_text_cleanup_node import HTTextCleanupNode
-    logger.debug("Imported ht_text_cleanup_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_text_cleanup_node: {e}")
-    raise
+# Image Processing Nodes
+import_node("HTResizeNode", "ht_resize_node")
+import_node("HTResolutionNode", "ht_resolution_node")
+import_node("HTLevelsNode", "ht_levels_node")
+import_node("HTBaseShiftNode", "ht_baseshift_node")
+import_node("HTTrainingSizeNode", "ht_training_size_node")
 
-try:
-    logger.debug("Importing ht_baseshift_node")
-    from .nodes.ht_baseshift_node import HTBaseShiftNode
-    logger.debug("Imported ht_baseshift_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_baseshift_node: {e}")
-    raise
+# Utility Nodes
+import_node("HTConversionNode", "ht_conversion_node")
+import_node("HTSwitchNode", "ht_switch_node")
 
-try:
-    logger.debug("Importing ht_levels_node")
-    from .nodes.ht_levels_node import HTLevelsNode
-    logger.debug("Imported ht_levels_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_levels_node: {e}")
-    raise
+# Layer Management Nodes
+import_node("HTLayerCollectorNode", "ht_layer_nodes")
+import_node("HTLayerExportNode", "ht_layer_nodes")
 
-try:
-    logger.debug("Importing ht_layer_nodes")
-    from .nodes.ht_layer_nodes import HTLayerCollectorNode, HTLayerExportNode
-    logger.debug("Imported ht_layer_nodes")
-except ImportError as e:
-    logger.exception(f"Error importing ht_layer_nodes: {e}")
-    raise
+logger.debug(f"Import results: {list(imported_nodes.keys())}")
 
-try:
-    logger.debug("Importing ht_training_size_node")
-    from .nodes.ht_training_size_node import HTTrainingSizeNode
-    logger.debug("Imported ht_training_size_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_training_size_node: {e}")
-    raise
+#------------------------------------------------------------------------------
+# Section 3: Node Registration
+#------------------------------------------------------------------------------
+logger.debug("Starting node registration...")
 
-try:
-    logger.debug("Importing ht_dimension_formatter_node")
-    from .nodes.ht_dimension_formatter_node import HTDimensionFormatterNode
-    logger.debug("Imported ht_dimension_formatter_node")
-except ImportError as e:
-    logger.exception(f"Error importing ht_dimension_formatter_node: {e}")
-    raise
+# Map node classes to their internal names
+NODE_CLASS_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS = {}
 
-logger.debug("Building NODE_CLASS_MAPPINGS")
-NODE_CLASS_MAPPINGS = {
-    "HTRegexNode": HTRegexNode,
-    "HTResizeNode": HTResizeNode,
-    "HTResolutionNode": HTResolutionNode,
-    "HTConversionNode": HTConversionNode,
-    "HTSwitchNode": HTSwitchNode,
-    "HTParameterExtractorNode": HTParameterExtractorNode,
-    "HTTextCleanupNode": HTTextCleanupNode,
-    "HTBaseShiftNode": HTBaseShiftNode,
-    "HTLevelsNode": HTLevelsNode,
-    "HTLayerCollectorNode": HTLayerCollectorNode,
-    "HTLayerExportNode": HTLayerExportNode,
-    "HTTrainingSizeNode": HTTrainingSizeNode,
-    "HTDimensionFormatterNode": HTDimensionFormatterNode
-}
-logger.debug("Finished building NODE_CLASS_MAPPINGS")
+# Only register successfully imported nodes
+for node_name, node_class in imported_nodes.items():
+    try:
+        logger.debug(f"Registering {node_name}")
+        
+        # Verify node class has required attributes
+        required_attrs = ['CATEGORY', 'INPUT_TYPES', 'RETURN_TYPES']
+        missing_attrs = [attr for attr in required_attrs if not hasattr(node_class, attr)]
+        
+        if missing_attrs:
+            logger.error(f"{node_name} missing required attributes: {missing_attrs}")
+            continue
+            
+        # Register the node
+        NODE_CLASS_MAPPINGS[node_name] = node_class
+        NODE_DISPLAY_NAME_MAPPINGS[node_name] = f"HT {' '.join(node_name.split('HT')[1].split('Node')[0].split('_'))}"
+        
+        logger.debug(f"Successfully registered {node_name}")
+        logger.debug(f"Category: {node_class.CATEGORY}")
+        logger.debug(f"Input Types: {node_class.INPUT_TYPES()}")
+        logger.debug(f"Return Types: {node_class.RETURN_TYPES}")
+        
+    except Exception as e:
+        logger.error(f"Error registering {node_name}: {str(e)}")
+        logger.error(traceback.format_exc())
 
-logger.debug("Building NODE_DISPLAY_NAME_MAPPINGS")
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "HTRegexNode": "HT Regex Parser",
-    "HTResizeNode": "HT Smart Resize",
-    "HTResolutionNode": "HT Resolution Recommender",
-    "HTPauseNode": "HT Pause Workflow", #This was present in your original code. I left it.
-    "HTConversionNode": "HT Type Converter",
-    "HTSwitchNode": "HT Switch",
-    "HTParameterExtractorNode": "HT Parameter Extractor",
-    "HTTextCleanupNode": "HT Text Cleanup",
-    "HTBaseShiftNode": "HT Base Shift Calculator",
-    "HTLevelsNode": "HT Levels Correction",
-    "HTLayerCollectorNode": "HT Layer Collector",
-    "HTLayerExportNode": "HT Layer Export",
-    "HTTrainingSizeNode": "HT Training Size Calculator",
-    "HTDimensionFormatterNode": "HT Dimension Formatter"
-}
-logger.debug("Finished building NODE_DISPLAY_NAME_MAPPINGS")
+logger.debug(f"Final NODE_CLASS_MAPPINGS: {list(NODE_CLASS_MAPPINGS.keys())}")
+logger.debug(f"Final NODE_DISPLAY_NAME_MAPPINGS: {NODE_DISPLAY_NAME_MAPPINGS}")
 
+#------------------------------------------------------------------------------
+# Section 4: Package Exports
+#------------------------------------------------------------------------------
+# These mappings will be imported by ComfyUI
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
 
-logger.debug("Exiting __init__.py")
+if len(NODE_CLASS_MAPPINGS) > 0:
+    logger.info(f"HommageTools successfully registered {len(NODE_CLASS_MAPPINGS)} nodes")
+else:
+    logger.error("No nodes were successfully registered!")
+    
