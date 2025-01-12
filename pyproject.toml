@@ -1,0 +1,15 @@
+[project]
+name = "hommagetools"
+description = "Entry point for HommageTools node collection for ComfyUI. Handles node registration, imports, and logging configuration."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["torch>=2.0.0", "numpy>=1.21.0", "Pillow>=9.0.0", "psd-tools>=1.9.24"]
+
+[project.urls]
+Repository = "https://github.com/ArtHommage/HommageTools"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "HommageTools"
+Icon = ""
