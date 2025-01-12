@@ -1,9 +1,8 @@
 """
 File: ComfyUI-HommageTools/__init__.py
-Version: 1.0.1
+Version: 1.0.2
 Description: Entry point for HommageTools node collection for ComfyUI.
              Handles node registration, imports, and logging configuration.
-             Enhanced with detailed debugging output.
 
 Sections:
 1. Module Configuration
@@ -15,14 +14,15 @@ Sections:
 #------------------------------------------------------------------------------
 # Section 1: Module Configuration
 #------------------------------------------------------------------------------
-import logging
+import os
 import sys
+import logging
+import importlib.util
 from pathlib import Path
-import traceback
 
-# Configure logging with more detailed format
+# Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG level
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.FileHandler('homage_tools_debug.log'),
@@ -32,66 +32,72 @@ logging.basicConfig(
 logger = logging.getLogger('HommageTools')
 logger.debug("Initializing HommageTools...")
 
-# Add nodes directory to Python path
-NODES_DIR = Path(__file__).parent / "nodes"
-logger.debug(f"Checking nodes directory: {NODES_DIR}")
+# Get the absolute path of the nodes directory
+NODES_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "nodes")
+logger.debug(f"Nodes directory path: {NODES_DIR}")
 
-if not NODES_DIR.exists():
+if not os.path.exists(NODES_DIR):
     logger.error(f"Nodes directory not found at {NODES_DIR}")
     raise FileNotFoundError(f"Nodes directory not found at {NODES_DIR}")
-
-logger.debug(f"Found nodes directory. Contents: {[f.name for f in NODES_DIR.iterdir() if f.is_file()]}")
 
 #------------------------------------------------------------------------------
 # Section 2: Node Imports
 #------------------------------------------------------------------------------
+def load_module(file_path, module_name):
+    """
+    Load a Python module from file path.
+    """
+    logger.debug(f"Attempting to load module: {module_name} from {file_path}")
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is None:
+            logger.error(f"Failed to create spec for {module_name}")
+            return None
+            
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        logger.debug(f"Successfully loaded module: {module_name}")
+        return module
+    except Exception as e:
+        logger.error(f"Error loading module {module_name}: {str(e)}")
+        return None
+
 # Dictionary to track successful imports
 imported_nodes = {}
 
-def import_node(node_name, import_path):
-    """Helper function to import nodes with detailed error tracking"""
-    logger.debug(f"Attempting to import {node_name} from {import_path}")
-    try:
-        module_path = f".nodes.{import_path}"
-        module = __import__(module_path, fromlist=['*'], globals=globals())
-        node_class = getattr(module, node_name)
-        imported_nodes[node_name] = node_class
-        logger.debug(f"Successfully imported {node_name}")
-        return True
-    except ImportError as e:
-        logger.error(f"ImportError while loading {node_name}: {str(e)}")
-        logger.error(traceback.format_exc())
-        return False
-    except AttributeError as e:
-        logger.error(f"AttributeError while loading {node_name}: {str(e)}")
-        logger.error(traceback.format_exc())
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error while loading {node_name}: {str(e)}")
-        logger.error(traceback.format_exc())
-        return False
+# Node file mapping
+NODE_FILES = {
+    "HTRegexNode": "ht_regex_node.py",
+    "HTParameterExtractorNode": "ht_parameter_extractor.py",
+    "HTTextCleanupNode": "ht_text_cleanup_node.py",
+    "HTResizeNode": "ht_resize_node.py",
+    "HTResolutionNode": "ht_resolution_node.py",
+    "HTLevelsNode": "ht_levels_node.py",
+    "HTBaseShiftNode": "ht_baseshift_node.py",
+    "HTTrainingSizeNode": "ht_training_size_node.py",
+    "HTConversionNode": "ht_conversion_node.py",
+    "HTSwitchNode": "ht_switch_node.py",
+    "HTLayerCollectorNode": "ht_layer_nodes.py",
+    "HTLayerExportNode": "ht_layer_nodes.py"
+}
 
 logger.debug("Starting node imports...")
 
-# Text Processing Nodes
-import_node("HTRegexNode", "ht_regex_node")
-import_node("HTParameterExtractorNode", "ht_parameter_extractor")
-import_node("HTTextCleanupNode", "ht_text_cleanup_node")
-
-# Image Processing Nodes
-import_node("HTResizeNode", "ht_resize_node")
-import_node("HTResolutionNode", "ht_resolution_node")
-import_node("HTLevelsNode", "ht_levels_node")
-import_node("HTBaseShiftNode", "ht_baseshift_node")
-import_node("HTTrainingSizeNode", "ht_training_size_node")
-
-# Utility Nodes
-import_node("HTConversionNode", "ht_conversion_node")
-import_node("HTSwitchNode", "ht_switch_node")
-
-# Layer Management Nodes
-import_node("HTLayerCollectorNode", "ht_layer_nodes")
-import_node("HTLayerExportNode", "ht_layer_nodes")
+# Import all nodes
+for node_name, file_name in NODE_FILES.items():
+    file_path = os.path.join(NODES_DIR, file_name)
+    if not os.path.exists(file_path):
+        logger.error(f"Node file not found: {file_path}")
+        continue
+        
+    module = load_module(file_path, file_name[:-3])
+    if module is not None:
+        try:
+            node_class = getattr(module, node_name)
+            imported_nodes[node_name] = node_class
+            logger.debug(f"Successfully imported {node_name}")
+        except AttributeError as e:
+            logger.error(f"Failed to get class {node_name} from module: {str(e)}")
 
 logger.debug(f"Import results: {list(imported_nodes.keys())}")
 
@@ -122,13 +128,9 @@ for node_name, node_class in imported_nodes.items():
         NODE_DISPLAY_NAME_MAPPINGS[node_name] = f"HT {' '.join(node_name.split('HT')[1].split('Node')[0].split('_'))}"
         
         logger.debug(f"Successfully registered {node_name}")
-        logger.debug(f"Category: {node_class.CATEGORY}")
-        logger.debug(f"Input Types: {node_class.INPUT_TYPES()}")
-        logger.debug(f"Return Types: {node_class.RETURN_TYPES}")
         
     except Exception as e:
         logger.error(f"Error registering {node_name}: {str(e)}")
-        logger.error(traceback.format_exc())
 
 logger.debug(f"Final NODE_CLASS_MAPPINGS: {list(NODE_CLASS_MAPPINGS.keys())}")
 logger.debug(f"Final NODE_DISPLAY_NAME_MAPPINGS: {NODE_DISPLAY_NAME_MAPPINGS}")
@@ -143,4 +145,3 @@ if len(NODE_CLASS_MAPPINGS) > 0:
     logger.info(f"HommageTools successfully registered {len(NODE_CLASS_MAPPINGS)} nodes")
 else:
     logger.error("No nodes were successfully registered!")
-    
