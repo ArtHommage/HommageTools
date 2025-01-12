@@ -1,109 +1,71 @@
 """
-HommageTools Resolution Recommender Node
+File: homage_tools/nodes/ht_resolution_node.py
 Version: 1.0.0
-Description: A node that analyzes image dimensions and recommends optimal resolutions based on 
-standard sizes or custom resolution lists.
-
-Sections:
-1. Imports and Setup
-2. Node Class Definition
-3. Resolution Analysis Methods
-4. Main Processing Logic
+Description: Node for recommending optimal image resolutions
 """
 
-import math
-import re
-from typing import List, Tuple, Dict, Optional, Union
+from typing import List, Tuple, Dict, Union, Optional
 import torch
 
 class HTResolutionNode:
-    """
-    Recommends optimal resolutions for images based on various quality priorities
-    and standard or custom resolution lists.
-    """
+    """Recommends optimal resolutions for images."""
     
     CATEGORY = "HommageTools"
-    RETURN_TYPES = ("INT", "INT", "FLOAT", "STRING", "STRING")
-    RETURN_NAMES = ("width", "height", "scale_factor", "crop_pad_values", "info")
+    RETURN_TYPES = ("INT", "INT", "FLOAT", "STRING", "STRING", "INT", "INT")
+    RETURN_NAMES = ("width", "height", "scale_factor", "crop_pad_values", "info", "pad_left_right", "pad_top_bottom")
     FUNCTION = "recommend_resolution"
 
-    # Default resolution list (width, height)
     DEFAULT_RESOLUTIONS = [
-        (1408, 1408), (1728, 1152), (1664, 1216), (1920, 1088),
-        (2176, 960), (1024, 1024), (1216, 832), (1152, 896),
-        (1344, 768), (1536, 640), (320, 320), (384, 256),
-        (448, 320), (448, 256), (576, 256)
+        # Square
+        (512, 512), (768, 768), (1024, 1024), (1408, 1408),
+        # Landscape 16:9
+        (1024, 576), (1152, 648), (1280, 720), (1408, 792),
+        (1536, 864), (1664, 936), (1792, 1008), (1920, 1080),
+        # Portrait 9:16
+        (576, 1024), (648, 1152), (720, 1280), (792, 1408),
+        (864, 1536), (936, 1664), (1008, 1792), (1080, 1920),
+        # Landscape 2:1
+        (1024, 512), (1152, 576), (1280, 640), (1408, 704),
+        # Portrait 1:2
+        (512, 1024), (576, 1152), (640, 1280), (704, 1408)
     ]
 
     @classmethod
     def INPUT_TYPES(cls) -> dict:
-        """
-        Define input types and their specifications.
-        """
         return {
             "required": {
-                "image": ("IMAGE", {"tooltip": "Input image to analyze"}),
+                "width": ("INT", {
+                    "default": 512,
+                    "min": 64,
+                    "max": 8192,
+                    "step": 8,
+                    "description": "Image width in pixels"
+                }),
+                "height": ("INT", {
+                    "default": 512,
+                    "min": 64,
+                    "max": 8192,
+                    "step": 8,
+                    "description": "Image height in pixels"
+                }),
                 "priority_mode": (["minimize_loss", "minimize_noise", "auto_decide"], {
-                    "default": "auto_decide",
-                    "tooltip": "Priority for resolution selection"
+                    "default": "auto_decide"
                 }),
                 "use_standard_list": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Use standard resolution list or custom"
+                    "default": True
                 }),
                 "mode": (["crop", "pad"], {
-                    "default": "crop",
-                    "tooltip": "Method to handle dimension differences"
-                }),
+                    "default": "crop"
+                })
             },
             "optional": {
+                "image": ("IMAGE",),
                 "custom_resolutions": ("STRING", {
                     "multiline": True,
-                    "default": "",
-                    "placeholder": "1024x1024, 1920x1080...",
-                    "tooltip": "Custom resolution list (comma or newline separated)"
-                }),
+                    "default": ""
+                })
             }
         }
-
-    def parse_resolution_list(self, text: str) -> List[Tuple[int, int]]:
-        """Parse a resolution list from string format."""
-        resolutions = []
-        
-        # Replace any whitespace around commas with just comma
-        text = re.sub(r'\s*,\s*', ',', text.strip())
-        
-        # Split on either commas or newlines
-        items = text.split(',') if ',' in text else text.splitlines()
-        
-        for item in items:
-            item = item.strip()
-            if not item:  # Skip empty lines
-                continue
-                
-            # Validate format
-            if not re.match(r'^\d+x\d+$', item):
-                print(f"Warning: Skipping invalid resolution format: {item}")
-                continue
-                
-            try:
-                w, h = map(int, item.split('x'))
-                # Add both orientations
-                resolutions.append((w, h))
-                if w != h:  # Don't add duplicate for square resolutions
-                    resolutions.append((h, w))
-            except ValueError:
-                print(f"Warning: Couldn't parse resolution values: {item}")
-                continue
-                
-        return resolutions
-
-    def get_aspect_ratio_str(self, width: int, height: int) -> str:
-        """Calculate and return simplified aspect ratio as string."""
-        gcd = math.gcd(width, height)
-        simple_w = width // gcd
-        simple_h = height // gcd
-        return f"{simple_w}:{simple_h}"
 
     def calculate_quality_metrics(
         self,
@@ -113,9 +75,10 @@ class HTResolutionNode:
         target_h: int,
         mode: str
     ) -> Dict[str, float]:
-        """Calculate quality impact metrics for the transformation."""
-        original_pixels = original_w * original_h
-        target_pixels = target_w * target_h
+        """Calculate quality impact metrics."""
+        original_aspect = original_w / original_h
+        target_aspect = target_w / target_h
+        aspect_ratio_diff = abs(original_aspect - target_aspect)
         
         if mode == "crop":
             scale_factor = min(target_w / original_w, target_h / original_h)
@@ -123,16 +86,14 @@ class HTResolutionNode:
             scaled_h = int(original_h * scale_factor)
             pixels_lost = (scaled_w * scaled_h) - (target_w * target_h)
             pixel_loss_percent = (pixels_lost / (scaled_w * scaled_h)) * 100
-        else:  # pad
+        else:
             scale_factor = max(target_w / original_w, target_h / original_h)
-            scaled_w = int(original_w * scale_factor)
-            scaled_h = int(original_h * scale_factor)
             pixel_loss_percent = 0
             
         return {
             "scale_factor": scale_factor,
             "pixel_loss_percent": pixel_loss_percent,
-            "target_pixels": target_pixels
+            "aspect_ratio_diff": aspect_ratio_diff
         }
 
     def calculate_score(
@@ -144,109 +105,89 @@ class HTResolutionNode:
         priority_mode: str,
         mode: str
     ) -> float:
-        """Calculate score for a potential resolution based on priority mode."""
+        """Calculate resolution score with aspect ratio preservation."""
         metrics = self.calculate_quality_metrics(
             original_w, original_h, target_w, target_h, mode
         )
         
-        # Base weights
-        PIXEL_LOSS_WEIGHT = 1.0
-        SCALE_WEIGHT = 1.0
+        aspect_weight = 3.0  # High weight for aspect ratio preservation
+        pixel_loss_weight = 2.0 if priority_mode == "minimize_loss" else 0.5
+        scale_weight = 0.5 if priority_mode == "minimize_loss" else 2.0
         
-        # Adjust weights based on priority mode
-        if priority_mode == "minimize_loss":
-            PIXEL_LOSS_WEIGHT = 2.0
-            SCALE_WEIGHT = 0.5
-        elif priority_mode == "minimize_noise":
-            PIXEL_LOSS_WEIGHT = 0.5
-            SCALE_WEIGHT = 2.0
-        # auto_decide uses base weights
-        
-        # Calculate individual scores
-        scale_score = abs(1 - metrics["scale_factor"]) * SCALE_WEIGHT
-        pixel_loss_score = (metrics["pixel_loss_percent"] / 100) * PIXEL_LOSS_WEIGHT
-        
-        # Penalties
-        if metrics["scale_factor"] > 1.5:
-            scale_score *= (metrics["scale_factor"] - 1.5) ** 2
-        if metrics["pixel_loss_percent"] > 10:
-            pixel_loss_score *= (metrics["pixel_loss_percent"] / 10)
+        aspect_score = metrics["aspect_ratio_diff"] * aspect_weight
+        scale_score = abs(1 - metrics["scale_factor"]) * scale_weight
+        pixel_loss_score = (metrics["pixel_loss_percent"] / 100) * pixel_loss_weight
             
-        return scale_score + pixel_loss_score
+        return aspect_score + scale_score + pixel_loss_score
 
-    def recommend_resolution(
-        self,
-        image: torch.Tensor,
-        priority_mode: str,
-        use_standard_list: bool,
-        mode: str,
-        custom_resolutions: str = ""
-    ) -> Tuple[int, int, float, str, str]:
-        """
-        Main function to recommend resolution based on inputs.
+    def recommend_resolution(self, width: int, height: int, priority_mode: str, use_standard_list: bool, mode: str, image: Optional[torch.Tensor] = None, custom_resolutions: str = "") -> Tuple[Optional[int], Optional[int], float, str, str, int, int]:
+        """Main resolution recommendation function."""
+
+        input_width, input_height = width, height
+        if image is not None:
+            if image.ndim == 3:
+                input_height, input_width, _ = image.shape
+            elif image.ndim == 4:
+                _, input_height, input_width, _ = image.shape
+            else:
+                raise ValueError(f"Unexpected tensor shape: {image.shape}")
+
+        resolutions = self.DEFAULT_RESOLUTIONS
+
+        if custom_resolutions:
+            try:
+                custom_res = [tuple(map(int, res.split('x'))) for res in custom_resolutions.strip().split('\n')]
+                resolutions = list(set(resolutions + custom_res))
+            except ValueError:
+                print("Invalid custom resolutions format. Using default resolutions.")
+
+        best_match = None
+        best_score = float('inf')
+        best_metrics = None
+
+        for w, h in resolutions:
+            score = self.calculate_score(input_width, input_height, w, h, priority_mode, mode)
+
+            if score < best_score:
+                best_score = score
+                best_match = (w, h)
+                best_metrics = self.calculate_quality_metrics(input_width, input_height, w, h, mode)
+
+        if not best_match:
+            return (None, None, 1.0, "No suitable resolution found", "No changes required", 0, 0)
+
+        scale_factor = best_metrics["scale_factor"]
+
+        if mode == "crop":
+            scaled_width = int(input_width * scale_factor)
+            scaled_height = int(input_height * scale_factor)
+            crop_w = max(0, scaled_width - best_match[0]) // 2
+            crop_h = max(0, scaled_height - best_match[1]) // 2
+            mod_str = f"Crop: left/right={crop_w}, top/bottom={crop_h}"
+            pad_w, pad_h = 0, 0
+        else:  # Padding mode
+            scale_to_fit = min(best_match[0] / input_width, best_match[1] / input_height)
+            scaled_width = int(input_width * scale_to_fit)
+            scaled_height = int(input_height * scale_to_fit)
+
+            pad_w = best_match[0] - scaled_width
+            pad_h = best_match[1] - scaled_height
+
+            left_pad = pad_w // 2
+            right_pad = pad_w - left_pad
+            top_pad = pad_h // 2
+            bottom_pad = pad_h - top_pad
+
+            mod_str = f"Pad: left/right={left_pad}/{right_pad}, top/bottom={top_pad}/{bottom_pad}"
+
+        info = (
+            f"Input: {input_width}x{input_height}\n"
+            f"Output: {best_match[0]}x{best_match[1]}\n"
+            f"Scale: {scale_factor:.3f}x\n"
+            f"Quality: {100-best_metrics['pixel_loss_percent']:.1f}% preserved\n"
+            f"Aspect Ratio Diff: {best_metrics['aspect_ratio_diff']:.3f}"
+        )
+
+        return (best_match[0], best_match[1], float(scale_factor), mod_str, info, pad_w, pad_h)
         
-        Returns:
-            Tuple[int, int, float, str, str]: (width, height, scale_factor, crop_pad_values, info_string)
-        """
-        try:
-            # Get input image dimensions
-            in_h, in_w = image.shape[-2:]
-            
-            # Get resolution list
-            if use_standard_list or not custom_resolutions.strip():
-                resolutions = self.DEFAULT_RESOLUTIONS
-            else:
-                resolutions = self.parse_resolution_list(custom_resolutions)
-                if not resolutions:  # If parsing failed, use defaults
-                    print("Warning: Using default resolutions due to parsing failure")
-                    resolutions = self.DEFAULT_RESOLUTIONS
-            
-            # Find best match
-            best_match = None
-            best_score = float('inf')
-            best_metrics = None
-            
-            for w, h in resolutions:
-                score = self.calculate_score(
-                    in_w, in_h, w, h,
-                    priority_mode, mode
-                )
-                
-                if score < best_score:
-                    best_score = score
-                    best_match = (w, h)
-                    best_metrics = self.calculate_quality_metrics(
-                        in_w, in_h, w, h, mode
-                    )
-            
-            if not best_match:
-                return (in_w, in_h, 1.0, "No change needed", "No changes required")
-                
-            # Calculate padding/cropping values
-            scale_factor = best_metrics["scale_factor"]
-            scaled_w = int(in_w * scale_factor)
-            scaled_h = int(in_h * scale_factor)
-            
-            if mode == "crop":
-                crop_w = max(0, scaled_w - best_match[0]) // 2
-                crop_h = max(0, scaled_h - best_match[1]) // 2
-                crop_pad_str = f"Crop: left/right={crop_w}, top/bottom={crop_h}"
-            else:
-                pad_w = max(0, best_match[0] - scaled_w) // 2
-                pad_h = max(0, best_match[1] - scaled_h) // 2
-                crop_pad_str = f"Pad: left/right={pad_w}, top/bottom={pad_h}"
-            
-            # Create info string
-            info = (
-                f"Input: {in_w}x{in_h} ({self.get_aspect_ratio_str(in_w, in_h)})\n"
-                f"Output: {best_match[0]}x{best_match[1]} "
-                f"({self.get_aspect_ratio_str(*best_match)})\n"
-                f"Scale: {scale_factor:.3f}x\n"
-                f"Quality: {100-best_metrics['pixel_loss_percent']:.1f}% preserved"
-            )
-            
-            return (best_match[0], best_match[1], float(scale_factor), crop_pad_str, info)
-            
-        except Exception as e:
-            print(f"Error in HTResolutionNode: {str(e)}")
-            return (512, 512, 1.0, "Error occurred", str(e))
+        return (best_match[0], best_match[1], float(scale_factor), mod_str, info, pad_w, pad_h)
