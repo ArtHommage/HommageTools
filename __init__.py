@@ -1,7 +1,7 @@
 """
 File: ComfyUI-HommageTools/__init__.py
 Version: 1.0.3
-Description: Initialization file with added inspector node
+Description: Initialization file for HommageTools node collection
 """
 
 import os
@@ -13,9 +13,9 @@ from typing import Dict, Type, Any
 NODES_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "nodes")
 
 #------------------------------------------------------------------------------
-# Section 2: Node Registration
+# Section 2: Node Imports
 #------------------------------------------------------------------------------
-# Import existing nodes
+# Import all nodes
 from .nodes.ht_regex_node import HTRegexNode
 from .nodes.ht_parameter_extractor import HTParameterExtractorNode
 from .nodes.ht_text_cleanup_node import HTTextCleanupNode
@@ -35,8 +35,11 @@ from .nodes.ht_sampler_bridge_node import HTSamplerBridgeNode
 from .nodes.ht_scheduler_bridge_node import HTSchedulerBridgeNode
 from .nodes.ht_flexible_node import HTFlexibleNode
 from .nodes.ht_inspector_node import HTInspectorNode
+from .nodes.ht_widget_control_node import HTWidgetControlNode
 
-# Register all nodes
+#------------------------------------------------------------------------------
+# Section 3: Node Registration
+#------------------------------------------------------------------------------
 NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     "HTRegexNode": HTRegexNode,
     "HTParameterExtractorNode": HTParameterExtractorNode,
@@ -58,8 +61,12 @@ NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     "HTSchedulerBridgeNode": HTSchedulerBridgeNode,
     "HTFlexibleNode": HTFlexibleNode,
     "HTInspectorNode": HTInspectorNode,
+    "HTWidgetControlNode": HTWidgetControlNode,
 }
 
+#------------------------------------------------------------------------------
+# Section 4: Display Name Mappings
+#------------------------------------------------------------------------------
 NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "HTRegexNode": "HT Regex",
     "HTParameterExtractorNode": "HT Parameter Extractor",
@@ -81,7 +88,10 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "HTSchedulerBridgeNode": "HT Scheduler Bridge",
     "HTFlexibleNode": "HT Flexible",
     "HTInspectorNode": "HT Inspector",
+    "HTWidgetControlNode": "HT Widget Control",
 }
 
-# Export mappings
+#------------------------------------------------------------------------------
+# Section 5: Exports
+#------------------------------------------------------------------------------
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
