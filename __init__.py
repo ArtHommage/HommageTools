@@ -1,7 +1,7 @@
 """
 File: ComfyUI-HommageTools/__init__.py
 Version: 1.0.3
-Description: Initialization file with added sampler and scheduler bridge nodes
+Description: Initialization file with added inspector node
 """
 
 import os
@@ -34,6 +34,7 @@ from .nodes.ht_mask_validator_node import HTMaskValidatorNode
 from .nodes.ht_sampler_bridge_node import HTSamplerBridgeNode
 from .nodes.ht_scheduler_bridge_node import HTSchedulerBridgeNode
 from .nodes.ht_flexible_node import HTFlexibleNode
+from .nodes.ht_inspector_node import HTInspectorNode
 
 # Register all nodes
 NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
@@ -56,6 +57,7 @@ NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     "HTSamplerBridgeNode": HTSamplerBridgeNode,
     "HTSchedulerBridgeNode": HTSchedulerBridgeNode,
     "HTFlexibleNode": HTFlexibleNode,
+    "HTInspectorNode": HTInspectorNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
@@ -78,6 +80,7 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "HTSamplerBridgeNode": "HT Sampler Bridge",
     "HTSchedulerBridgeNode": "HT Scheduler Bridge",
     "HTFlexibleNode": "HT Flexible",
+    "HTInspectorNode": "HT Inspector",
 }
 
 # Export mappings
