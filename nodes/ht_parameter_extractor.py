@@ -29,7 +29,7 @@ class HTParameterExtractorNode:
                     "default": "&&"
                 }),
                 "identifier": ("STRING", {
-                    "default": "$$"
+                    "default": "%%"
                 }),
                 "label": ("STRING", {
                     "default": ""
