@@ -25,7 +25,7 @@ class HTWidgetControlNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "mode": (["fixed", "increment", "randomize"], {
+                "mode": (["fixed", "increment", "decrement", "randomize"], {
                     "default": "fixed"
                 }),
                 "target_widget": (["control_after_generate"], {
