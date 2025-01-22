@@ -25,6 +25,7 @@ from .nodes.ht_surface_blur_node import HTSurfaceBlurNode
 from .nodes.ht_photoshop_blur_node import HTPhotoshopBlurNode
 from .nodes.ht_levels_node import HTLevelsNode
 from .nodes.ht_resize_node import HTResizeNode
+from .nodes.ht_oidn_node import HTOIDNNode
 
 # Dimension Handling Nodes
 from .nodes.ht_resolution_node import HTResolutionNode
@@ -49,6 +50,9 @@ from .nodes.ht_flexible_node import HTFlexibleNode
 from .nodes.ht_inspector_node import HTInspectorNode
 from .nodes.ht_widget_control_node import HTWidgetControlNode
 
+# Model Management Nodes
+from .nodes.ht_diffusion_loader_multi import HTDiffusionLoaderMulti
+
 #------------------------------------------------------------------------------
 # Section 3: Node Registration
 #------------------------------------------------------------------------------
@@ -63,6 +67,7 @@ NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     "HTPhotoshopBlurNode": HTPhotoshopBlurNode,
     "HTLevelsNode": HTLevelsNode,
     "HTResizeNode": HTResizeNode,
+    "HTOIDNNode": HTOIDNNode,
     
     # Dimension Handling
     "HTResolutionNode": HTResolutionNode,
@@ -86,7 +91,10 @@ NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     "HTValueMapperNode": HTValueMapperNode,
     "HTFlexibleNode": HTFlexibleNode,
     "HTInspectorNode": HTInspectorNode,
-    "HTWidgetControlNode": HTWidgetControlNode
+    "HTWidgetControlNode": HTWidgetControlNode,
+    
+    # Model Management
+    "HTDiffusionLoaderMulti": HTDiffusionLoaderMulti
 }
 
 #------------------------------------------------------------------------------
@@ -103,6 +111,7 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "HTPhotoshopBlurNode": "HT Photoshop Blur",
     "HTLevelsNode": "HT Levels",
     "HTResizeNode": "HT Smart Resize",
+    "HTOIDNNode": "HT Intel Denoiser",
     
     # Dimension Handling
     "HTResolutionNode": "HT Resolution",
@@ -126,7 +135,10 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "HTValueMapperNode": "HT Value Mapper",
     "HTFlexibleNode": "HT Flexible",
     "HTInspectorNode": "HT Inspector",
-    "HTWidgetControlNode": "HT Widget Control"
+    "HTWidgetControlNode": "HT Widget Control",
+    
+    # Model Management
+    "HTDiffusionLoaderMulti": "HT Multi Model Loader"
 }
 
 #------------------------------------------------------------------------------
