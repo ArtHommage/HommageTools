@@ -1,29 +1,14 @@
 """
 File: homage_tools/nodes/ht_baseshift_node.py
-Version: 1.0.1
-Description: Node for calculating base shift values for image processing
-
-Sections:
-1. Imports and Type Definitions
-2. Node Class Definition and Configuration
-3. Calculation Methods
-4. Main Processing Logic
+Version: 1.0.2
+Description: Node for calculating base shift values with BHWC tensor handling
 """
 
-#------------------------------------------------------------------------------
-# Section 1: Imports and Type Definitions
-#------------------------------------------------------------------------------
 from typing import Dict, Any, Tuple, Optional
 import torch
 
-#------------------------------------------------------------------------------
-# Section 2: Node Class Definition and Configuration
-#------------------------------------------------------------------------------
 class HTBaseShiftNode:
-    """
-    Calculates base shift values for images.
-    Provides configurable shift parameters for image processing adjustments.
-    """
+    """Calculates base shift values for images."""
     
     CATEGORY = "HommageTools"
     FUNCTION = "calculate_shift"
@@ -32,10 +17,6 @@ class HTBaseShiftNode:
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
-        """
-        Define input parameters and their configurations.
-        Includes image dimensions and shift parameters with specific ranges and steps.
-        """
         return {
             "required": {
                 "image_width": ("INT", {
@@ -68,41 +49,6 @@ class HTBaseShiftNode:
             }
         }
 
-    #--------------------------------------------------------------------------
-    # Section 3: Calculation Methods
-    #--------------------------------------------------------------------------
-    def _calculate_max_shift(
-        self,
-        width: int,
-        height: int,
-        base_shift: float,
-        max_shift: float
-    ) -> float:
-        """
-        Calculate max shift value based on image dimensions and shift parameters.
-        
-        Args:
-            width: Image width in pixels
-            height: Image height in pixels
-            base_shift: Base shift value
-            max_shift: Maximum shift value
-            
-        Returns:
-            float: Calculated shift value
-        """
-        try:
-            calculated_shift = (
-                (base_shift - max_shift) / 
-                (256 - ((width * height) / 256)) * 
-                3840 + base_shift
-            )
-            return float(calculated_shift)
-        except ZeroDivisionError:
-            return float(base_shift)
-
-    #--------------------------------------------------------------------------
-    # Section 4: Main Processing Logic
-    #--------------------------------------------------------------------------
     def calculate_shift(
         self,
         image_width: int,
@@ -111,30 +57,26 @@ class HTBaseShiftNode:
         base_shift: float,
         image: Optional[torch.Tensor] = None
     ) -> Tuple[float, float]:
-        """Calculate shift values for image processing."""
-
-        print(f"Input image_width: {image_width}")
-        print(f"Input image_height: {image_height}")
+        """Calculate shift values using BHWC format."""
+        print(f"Input dimensions: {image_width}x{image_height}")
 
         if image is not None:
             print(f"Image tensor shape: {image.shape}")
-            if len(image.shape) == 3:  # (C, H, W)
-                _, image_height, image_width = image.shape
-            elif len(image.shape) == 4:  # (B, H, W, C) or (B, C, H, W)
-                if image.shape[1] < image.shape[2]: #check if channels are second or third dim
-                    _, channels, image_height, image_width = image.shape
-                else:
-                    _, image_height, image_width, channels = image.shape
+            if len(image.shape) == 3:  # HWC
+                image_height, image_width = image.shape[0:2]
+            elif len(image.shape) == 4:  # BHWC
+                image_height, image_width = image.shape[1:3]
             else:
-                raise ValueError(
-                    f"Image tensor has unsupported shape: {image.shape}. Expected 3 or 4 dimensions (C, H, W) or (B, H, W, C) or (B, C, H, W)"
-                )
+                raise ValueError(f"Unexpected tensor shape: {image.shape}")
 
-            print(f"Extracted image_width from tensor: {image_width}")
-            print(f"Extracted image_height from tensor: {image_height}")
+            print(f"Extracted dimensions: {image_width}x{image_height}")
 
-        calculated_max_shift = self._calculate_max_shift(
-            image_width, image_height, base_shift, max_shift
-        )
-
-        return (calculated_max_shift, base_shift)
+        try:
+            calculated_shift = (
+                (base_shift - max_shift) / 
+                (256 - ((image_width * image_height) / 256)) * 
+                3840 + base_shift
+            )
+            return (calculated_shift, base_shift)
+        except ZeroDivisionError:
+            return (base_shift, base_shift)
