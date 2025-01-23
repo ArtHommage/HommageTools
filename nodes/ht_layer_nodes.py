@@ -17,6 +17,9 @@ from psd_tools.constants import ColorMode
 
 logger = logging.getLogger('HommageTools')
 
+#------------------------------------------------------------------------------
+# Section 1: Helper Functions and Data Classes
+#------------------------------------------------------------------------------
 def process_tensor_dimensions(tensor: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, int]]:
     """Convert tensor to BHWC format."""
     print(f"\nDEBUG: Tensor processing:")
@@ -51,6 +54,9 @@ class LayerData:
         """Validate layer creation."""
         logger.debug(f"Created layer '{self.name}' with shape {self.image.shape}")
 
+#------------------------------------------------------------------------------
+# Section 2: Layer Collection Node
+#------------------------------------------------------------------------------
 class HTLayerCollectorNode:
     """Collects images into a layer stack with BHWC format handling."""
     
@@ -143,4 +149,136 @@ class HTLayerCollectorNode:
             if input_stack:
                 print(f"Current stack size: {len(input_stack)} layers")
             print(f"Attempting to add layer '{layer_name}' with shape {image.shape}")
+            raise
+
+#------------------------------------------------------------------------------
+# Section 3: Layer Export Node
+#------------------------------------------------------------------------------
+class HTLayerExportNode:
+    """Exports layer stack to PSD or TIFF format."""
+    
+    CATEGORY = "HommageTools/Layers"
+    FUNCTION = "export_layers"
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict:
+        return {
+            "required": {
+                "layer_stack": ("LAYER_STACK",),
+                "output_path": ("STRING", {
+                    "default": "output.psd",
+                    "multiline": False
+                }),
+                "format": (["psd", "tiff"], {
+                    "default": "psd"
+                })
+            }
+        }
+
+    def prepare_layer_data(
+        self,
+        layer: LayerData
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Prepare layer data for export."""
+        # Convert to numpy and ensure correct format
+        image_np = layer.image.cpu().numpy()
+        
+        # Handle alpha channel
+        if image_np.shape[-1] == 4:
+            return image_np[..., :3], image_np[..., 3]
+        return image_np, None
+
+    def export_as_psd(
+        self,
+        layer_stack: List[LayerData],
+        output_path: str
+    ) -> None:
+        """Export layers as PSD file."""
+        if not layer_stack:
+            raise ValueError("No layers to export")
+            
+        # Get dimensions from first layer
+        height, width = layer_stack[0].image.shape[1:3]
+        
+        # Create new PSD
+        psd = PSDImage.new(width, height, color_mode=ColorMode.RGB)
+        
+        # Add layers in reverse order (PSD layers are bottom-up)
+        for layer in reversed(layer_stack):
+            rgb_data, alpha_data = self.prepare_layer_data(layer)
+            
+            # Create layer
+            pil_image = Image.fromarray((rgb_data * 255).astype(np.uint8))
+            if alpha_data is not None:
+                alpha = Image.fromarray((alpha_data * 255).astype(np.uint8))
+                pil_image.putalpha(alpha)
+                
+            layer_specs = {"name": layer.name}
+            psd.compose([(pil_image, layer_specs)])
+            
+        # Save PSD
+        psd.save(output_path)
+
+    def export_as_tiff(
+        self,
+        layer_stack: List[LayerData],
+        output_path: str
+    ) -> None:
+        """Export layers as multi-page TIFF."""
+        if not layer_stack:
+            raise ValueError("No layers to export")
+            
+        # Prepare data for TIFF
+        pages = []
+        for layer in layer_stack:
+            rgb_data, alpha_data = self.prepare_layer_data(layer)
+            
+            # Convert to 8-bit format
+            rgb_data = (rgb_data * 255).astype(np.uint8)
+            if alpha_data is not None:
+                alpha_data = (alpha_data * 255).astype(np.uint8)
+                
+            # Combine RGB and alpha if present
+            if alpha_data is not None:
+                page_data = np.dstack([rgb_data, alpha_data])
+            else:
+                page_data = rgb_data
+                
+            pages.append(page_data)
+            
+        # Save multi-page TIFF
+        tifffile.imwrite(
+            output_path,
+            pages,
+            photometric='rgb',
+            planarconfig='contig'
+        )
+
+    def export_layers(
+        self,
+        layer_stack: List[LayerData],
+        output_path: str,
+        format: str = "psd"
+    ) -> Tuple:
+        """Export layer stack to specified format."""
+        try:
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            
+            # Export based on format
+            if format == "psd":
+                self.export_as_psd(layer_stack, output_path)
+            else:  # tiff
+                self.export_as_tiff(layer_stack, output_path)
+                
+            print(f"Successfully exported {len(layer_stack)} layers to {output_path}")
+            return tuple()
+            
+        except Exception as e:
+            logger.error(f"Error exporting layers: {str(e)}")
+            print(f"\nERROR exporting layers: {str(e)}")
+            if layer_stack:
+                print(f"Layer stack size: {len(layer_stack)}")
             raise
