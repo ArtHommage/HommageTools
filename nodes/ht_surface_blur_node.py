@@ -1,75 +1,212 @@
 """
 File: homage_tools/nodes/ht_surface_blur_node.py
-Version: 1.2.1
-Description: Surface blur with fixed imports
+Description: Memory-efficient surface blur with tiled processing and CUDA optimization
+Version: 1.4.1
+
+Sections:
+1. Imports and Configuration
+2. Memory Management Functions
+3. Tensor Validation and Debug
+4. Processing Implementation
+5. Node Class Definition
 """
 
+#------------------------------------------------------------------------------
+# Section 1: Imports and Configuration
+#------------------------------------------------------------------------------
 import torch
 import torch.nn.functional as F
-from typing import Dict, Any, Tuple, Optional, Union
+from typing import Dict, Any, Tuple, Optional
+import math
 import logging
-import time
 
 logger = logging.getLogger('HommageTools')
+VERSION = "1.4.1"
 
-def calculate_color_distance(center: torch.Tensor, neighbors: torch.Tensor, threshold: float) -> torch.Tensor:
-    diff = torch.abs(neighbors - center)
-    diff = torch.mean(diff, dim=-1, keepdim=True)
-    return torch.exp(-diff / threshold)
-
-def normalize_kernel(kernel: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return kernel / (torch.sum(kernel, dim=(1,2), keepdim=True) + eps)
-
-def process_surface_blur(image: torch.Tensor, radius: int, threshold: float, device: torch.device) -> torch.Tensor:
-    batch_size, height, width, channels = image.shape
+#------------------------------------------------------------------------------
+# Section 2: Memory Management Functions
+#------------------------------------------------------------------------------
+def calculate_memory_requirements(
+    height: int,
+    width: int,
+    channels: int,
+    radius: int,
+    dtype: torch.dtype
+) -> int:
+    """Calculate memory requirements for processing."""
     kernel_size = 2 * radius + 1
+    bytes_per_element = {
+        torch.float32: 4,
+        torch.float16: 2,
+        torch.float64: 8
+    }.get(dtype, 4)
     
-    y_coords = torch.arange(-radius, radius + 1, device=device)
-    x_coords = torch.arange(-radius, radius + 1, device=device)
-    y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
-    position_weights = torch.exp(-(x_grid.pow(2) + y_grid.pow(2)) / (2 * radius * radius))
+    # Calculate memory for main tensors (BHWC format)
+    input_memory = height * width * channels * bytes_per_element
+    unfold_memory = height * width * kernel_size * kernel_size * channels * bytes_per_element
+    weights_memory = kernel_size * kernel_size * bytes_per_element
     
-    tile_size = min(32, height, width)
-    result = torch.zeros_like(image)
+    # Add buffer for intermediate calculations (2x for safety)
+    total_memory = (input_memory + unfold_memory + weights_memory) * 2
     
-    for y in range(0, height, tile_size):
-        for x in range(0, width, tile_size):
-            y_end = min(y + tile_size, height)
-            x_end = min(x + tile_size, width)
-            
-            pad_y1, pad_y2 = radius, radius
-            pad_x1, pad_x2 = radius, radius
-            
-            if y == 0: pad_y1 = 0
-            if y_end == height: pad_y2 = 0
-            if x == 0: pad_x1 = 0
-            if x_end == width: pad_x2 = 0
-            
-            tile = image[:, max(0, y - radius):min(height, y_end + radius),
-                           max(0, x - radius):min(width, x_end + radius), :]
-            
-            tile_bchw = tile.permute(0, 3, 1, 2)
-            unfold = F.unfold(tile_bchw, kernel_size=(kernel_size, kernel_size), 
-                            padding=(pad_y1, pad_x1))
-            
-            patches = unfold.view(batch_size, channels, kernel_size * kernel_size, -1)
-            patches = patches.permute(0, 3, 2, 1)
-            
-            center_idx = kernel_size * kernel_size // 2
-            center = patches[:, :, center_idx:center_idx+1, :]
-            
-            weights = calculate_color_distance(center, patches, threshold)
-            weights = weights * position_weights.view(1, 1, -1, 1)
-            weights = normalize_kernel(weights)
-            
-            weighted_sum = torch.sum(patches * weights, dim=2)
-            weighted_sum = weighted_sum.view(batch_size, y_end - y, x_end - x, channels)
-            
-            result[:, y:y_end, x:x_end, :] = weighted_sum
-            
-    return result
+    return total_memory
 
+def get_optimal_tile_size(
+    height: int,
+    width: int,
+    channels: int,
+    radius: int,
+    dtype: torch.dtype
+) -> int:
+    """Calculate optimal tile size based on available memory."""
+    if torch.cuda.is_available():
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        available_memory = int(total_memory * 0.7)  # Use 70% of available memory
+    else:
+        available_memory = 8 * (1024 ** 3)  # Assume 8GB for CPU
+    
+    # Target memory per tile
+    target_memory = available_memory // 4  # Use 25% of available memory per tile
+    
+    # Calculate base tile size
+    kernel_size = 2 * radius + 1
+    bytes_per_pixel = channels * {
+        torch.float32: 4,
+        torch.float16: 2,
+        torch.float64: 8
+    }.get(dtype, 4)
+    
+    # Account for unfolding operation memory
+    memory_factor = kernel_size * kernel_size * 2  # 2x for safety
+    pixels_per_tile = target_memory / (bytes_per_pixel * memory_factor)
+    tile_size = int(math.sqrt(pixels_per_tile))
+    
+    # Ensure tile size is divisible by 8 for GPU efficiency
+    tile_size = max(256, (tile_size // 8) * 8)
+    
+    return tile_size
+
+#------------------------------------------------------------------------------
+# Section 3: Tensor Validation and Debug
+#------------------------------------------------------------------------------
+def debug_tensor_stats(tensor: torch.Tensor, name: str) -> None:
+    """Print debug statistics for tensor values and format."""
+    shape = tensor.shape
+    print(f"\nDebug {name}:")
+    print(f"Shape: {shape}")
+    
+    if len(shape) == 3:  # HWC
+        print(f"Format: HWC")
+        print(f"Dimensions: {shape[0]}x{shape[1]}")
+        print(f"Channels: {shape[2]}")
+    elif len(shape) == 4:  # BHWC
+        print(f"Format: BHWC")
+        print(f"Dimensions: {shape[1]}x{shape[2]}")
+        print(f"Batch: {shape[0]}, Channels: {shape[3]}")
+        
+    print(f"Value range: min={tensor.min().item():.3f}, max={tensor.max().item():.3f}")
+    if torch.isnan(tensor).any():
+        print("WARNING: Contains NaN values")
+    if torch.isinf(tensor).any():
+        print("WARNING: Contains Inf values")
+
+def verify_tensor_format(tensor: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, int]]:
+    """Verify and normalize tensor to BHWC format."""
+    if len(tensor.shape) == 3:  # HWC
+        tensor = tensor.unsqueeze(0)  # Add batch dimension
+        print("Converted HWC to BHWC format")
+        
+    if len(tensor.shape) != 4:
+        raise ValueError(f"Invalid tensor shape: {tensor.shape}")
+        
+    b, h, w, c = tensor.shape
+    return tensor, {
+        "batch_size": b,
+        "height": h,
+        "width": w,
+        "channels": c
+    }
+
+#------------------------------------------------------------------------------
+# Section 4: Processing Implementation
+#------------------------------------------------------------------------------
+def process_tile(
+    tile: torch.Tensor,
+    radius: int,
+    threshold: float,
+    device: torch.device
+) -> torch.Tensor:
+    """Process a single tile with surface blur."""
+    debug_tensor_stats(tile, "Input Tile")
+    
+    # Ensure BHWC format
+    tile, dims = verify_tensor_format(tile)
+    tile = tile.to(device)
+    
+    try:
+        kernel_size = 2 * radius + 1
+        
+        # Create position weights
+        y_coords = torch.arange(-radius, radius + 1, device=device)
+        x_coords = torch.arange(-radius, radius + 1, device=device)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        position_weights = torch.exp(-(x_grid.pow(2) + y_grid.pow(2)) / (2 * radius * radius))
+        
+        # Process each channel separately
+        channels = []
+        for c in range(dims['channels']):
+            channel = tile[..., c:c+1]
+            print(f"Processing channel {c}: shape={channel.shape}")
+            
+            # Convert to BCHW for unfold operation
+            x = channel.permute(0, 3, 1, 2)
+            print(f"Converted to BCHW: shape={x.shape}")
+            
+            # Extract patches
+            patches = F.unfold(
+                x,
+                kernel_size=(kernel_size, kernel_size),
+                padding=radius
+            )
+            
+            # Reshape patches
+            patches = patches.view(1, -1, kernel_size * kernel_size, channel.shape[1] * channel.shape[2])
+            
+            # Calculate color differences
+            center = patches[:, :, kernel_size * kernel_size // 2:kernel_size * kernel_size // 2 + 1]
+            color_weights = torch.exp(-torch.abs(patches - center) / threshold)
+            
+            # Apply weights
+            weights = color_weights * position_weights.view(1, 1, -1, 1)
+            weights = weights / weights.sum(dim=2, keepdim=True).clamp(min=1e-8)
+            
+            # Calculate weighted sum
+            result = (patches * weights).sum(dim=2)
+            
+            # Reshape back to image format
+            result = result.view(1, channel.shape[1], channel.shape[2], 1)
+            channels.append(result)
+            
+            # Clear GPU cache after each channel
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+        
+        # Combine channels
+        result = torch.cat(channels, dim=-1)
+        debug_tensor_stats(result, "Final Tile Output")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in tile processing: {str(e)}")
+        return tile
+
+#------------------------------------------------------------------------------
+# Section 5: Node Class Definition
+#------------------------------------------------------------------------------
 class HTSurfaceBlurNode:
+    """Surface blur with tiled processing and memory optimization."""
+    
     CATEGORY = "HommageTools/Filters"
     FUNCTION = "apply_surface_blur"
     RETURN_TYPES = ("IMAGE",)
@@ -91,29 +228,84 @@ class HTSurfaceBlurNode:
                     "min": 0.0,
                     "max": 255.0,
                     "step": 0.1
-                }),
-                "device": (["cpu", "gpu"], {
-                    "default": "gpu" if torch.cuda.is_available() else "cpu"
                 })
             }
         }
 
-    def apply_surface_blur(self, image: torch.Tensor, radius: int, threshold: float, device: str) -> Tuple[torch.Tensor]:
+    def apply_surface_blur(
+        self,
+        image: torch.Tensor,
+        radius: int,
+        threshold: float
+    ) -> Tuple[torch.Tensor]:
+        """Apply surface blur with tiled processing."""
+        print(f"\nHTSurfaceBlurNode v{VERSION} - Processing")
+        debug_tensor_stats(image, "Input Image")
+        
         try:
-            start_time = time.time()
+            # Ensure BHWC format
+            image, dims = verify_tensor_format(image)
             
-            if len(image.shape) == 3:
-                image = image.unsqueeze(0)
+            # Calculate optimal tile size
+            tile_size = get_optimal_tile_size(
+                dims['height'],
+                dims['width'],
+                dims['channels'],
+                radius,
+                image.dtype
+            )
+            print(f"Using tile size: {tile_size}x{tile_size}")
             
-            proc_device = torch.device("cuda" if device == "gpu" and torch.cuda.is_available() else "cpu")
-            result = process_surface_blur(image.to(proc_device), radius, threshold / 255.0, proc_device)
+            # Normalize threshold to 0-1 range
+            threshold = threshold / 255.0
             
-            if proc_device.type == "cuda":
-                result = result.cpu()
+            # Set processing device
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            print(f"Processing device: {device}")
             
-            print(f"Processing completed in {time.time() - start_time:.2f}s")
+            # Initialize output tensor
+            result = torch.zeros_like(image)
+            
+            # Process tiles
+            total_tiles = ((dims['height'] + tile_size - 1) // tile_size) * ((dims['width'] + tile_size - 1) // tile_size)
+            current_tile = 0
+            
+            for y in range(0, dims['height'], tile_size):
+                for x in range(0, dims['width'], tile_size):
+                    current_tile += 1
+                    print(f"\nProcessing tile {current_tile}/{total_tiles}")
+                    
+                    # Calculate tile bounds
+                    y_end = min(y + tile_size + radius, dims['height'])
+                    x_end = min(x + tile_size + radius, dims['width'])
+                    y_start = max(0, y - radius)
+                    x_start = max(0, x - radius)
+                    
+                    print(f"Tile coordinates: ({x_start}, {y_start}) to ({x_end}, {y_end})")
+                    
+                    # Extract and process tile
+                    tile = image[:, y_start:y_end, x_start:x_end, :]
+                    processed = process_tile(tile, radius, threshold, device)
+                    
+                    # Calculate output region
+                    out_y_start = y
+                    out_x_start = x
+                    out_y_end = min(y + tile_size, dims['height'])
+                    out_x_end = min(x + tile_size, dims['width'])
+                    
+                    # Store result
+                    result[:, out_y_start:out_y_end, out_x_start:out_x_end, :] = \
+                        processed[:, radius:radius+out_y_end-out_y_start, 
+                                radius:radius+out_x_end-out_x_start, :]
+                    
+                    # Clear GPU cache after each tile
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+            
+            debug_tensor_stats(result, "Final Output")
             return (result,)
             
         except Exception as e:
-            logger.error(f"Surface blur failed: {str(e)}")
+            logger.error(f"Error in surface blur: {str(e)}")
+            print(f"Error details: {str(e)}")
             return (image,)

@@ -3,4 +3,3 @@ torch>=2.0.0
 Pillow>=9.0.0
 tifffile>=2023.3.15
 psd-tools>=1.9.24
-oidn

@@ -1,11 +1,12 @@
 """
 File: homage_tools/nodes/ht_dimension_formatter_node.py
-Version: 1.2.1
+Version: 1.0.0
 Description: Node for formatting image dimensions with BHWC tensor handling
 """
 
 from typing import Dict, Any, Tuple, Optional
 import torch
+from server import PromptServer
 import logging
 
 logger = logging.getLogger('HommageTools')
@@ -65,7 +66,8 @@ class HTDimensionFormatterNode:
         width: int,
         height: int,
         spacing: str,
-        image: Optional[torch.Tensor] = None
+        image: Optional[torch.Tensor] = None,
+        **kwargs
     ) -> Tuple[str]:
         """Format dimensions with BHWC handling."""
         try:
@@ -76,8 +78,21 @@ class HTDimensionFormatterNode:
                     print(f"Using widget dimensions due to error: {str(e)}")
 
             result = f"{width}{spacing}x{spacing}{height}"
+            
+            # Send result to UI
+            if "unique_id" in kwargs:
+                PromptServer.instance.send_sync("update_preview", {
+                    "node": kwargs["unique_id"],
+                    "content": result
+                })
+            
             return (result,)
             
         except Exception as e:
             logger.error(f"Formatting error: {str(e)}")
             return ("Error formatting dimensions",)
+            
+    @classmethod
+    def IS_CHANGED(cls, **kwargs) -> float:
+        """Ensure node updates on every execution."""
+        return float("nan")

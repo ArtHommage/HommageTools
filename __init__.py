@@ -1,16 +1,31 @@
 """
 File: ComfyUI-HommageTools/__init__.py
-Version: 1.0.3
+Version: 1.1.1
 Description: Initialization file for HommageTools node collection
 """
 
 import os
+import sys
 from typing import Dict, Type, Any
 
 #------------------------------------------------------------------------------
 # Section 1: Basic Setup
 #------------------------------------------------------------------------------
-NODES_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "nodes")
+# Add package to path
+EXTENSION_DIR = os.path.dirname(os.path.realpath(__file__))
+if EXTENSION_DIR not in sys.path:
+    sys.path.append(EXTENSION_DIR)
+
+# Validate dependencies
+try:
+    from .dependency_check import validate_environment
+    validate_environment(silent=True)
+except Exception as e:
+    print(f"\nError initializing HommageTools:")
+    print(str(e))
+    print("\nPlease install required dependencies using:")
+    print("pip install -r requirements.txt")
+    raise
 
 #------------------------------------------------------------------------------
 # Section 2: Node Imports
@@ -22,6 +37,7 @@ from .nodes.ht_text_cleanup_node import HTTextCleanupNode
 
 # Image Processing Nodes
 from .nodes.ht_surface_blur_node import HTSurfaceBlurNode
+from .nodes.ht_resolution_downsample_node import HTResolutionDownsampleNode
 from .nodes.ht_photoshop_blur_node import HTPhotoshopBlurNode
 from .nodes.ht_levels_node import HTLevelsNode
 from .nodes.ht_resize_node import HTResizeNode
@@ -32,6 +48,8 @@ from .nodes.ht_resolution_node import HTResolutionNode
 from .nodes.ht_dimension_formatter_node import HTDimensionFormatterNode
 from .nodes.ht_dimension_analyzer_node import HTDimensionAnalyzerNode
 from .nodes.ht_training_size_node import HTTrainingSizeNode
+from .nodes.ht_mask_dilation_node import HTMaskDilationNode
+from .nodes.ht_tensor_info_node import HTTensorInfoNode
 
 # Layer Management Nodes
 from .nodes.ht_layer_nodes import HTLayerCollectorNode, HTLayerExportNode
@@ -44,11 +62,16 @@ from .nodes.ht_baseshift_node import HTBaseShiftNode
 
 # Utility and Control Nodes
 from .nodes.ht_switch_node import HTSwitchNode
+from .nodes.ht_status_indicator_node import HTStatusIndicatorNode
 from .nodes.ht_conversion_node import HTConversionNode
 from .nodes.ht_value_mapper_node import HTValueMapperNode
 from .nodes.ht_flexible_node import HTFlexibleNode
 from .nodes.ht_inspector_node import HTInspectorNode
 from .nodes.ht_widget_control_node import HTWidgetControlNode
+from .nodes.ht_splitter_node import HTSplitterNode
+from .nodes.ht_node_state_controller import HTNodeStateController
+from .nodes.ht_node_unmute_all import HTNodeUnmuteAll
+from .nodes.ht_null_node import HTNullNode
 
 # Model Management Nodes
 from .nodes.ht_diffusion_loader_multi import HTDiffusionLoaderMulti
@@ -56,7 +79,7 @@ from .nodes.ht_diffusion_loader_multi import HTDiffusionLoaderMulti
 #------------------------------------------------------------------------------
 # Section 3: Node Registration
 #------------------------------------------------------------------------------
-NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
+NODE_CLASS_MAPPINGS = {
     # Text Processing
     "HTRegexNode": HTRegexNode,
     "HTParameterExtractorNode": HTParameterExtractorNode,
@@ -64,6 +87,7 @@ NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     
     # Image Processing
     "HTSurfaceBlurNode": HTSurfaceBlurNode,
+    "HTResolutionDownsampleNode": HTResolutionDownsampleNode,
     "HTPhotoshopBlurNode": HTPhotoshopBlurNode,
     "HTLevelsNode": HTLevelsNode,
     "HTResizeNode": HTResizeNode,
@@ -74,6 +98,8 @@ NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     "HTDimensionFormatterNode": HTDimensionFormatterNode,
     "HTDimensionAnalyzerNode": HTDimensionAnalyzerNode,
     "HTTrainingSizeNode": HTTrainingSizeNode,
+    "HTMaskDilationNode": HTMaskDilationNode,
+    "HTTensorInfoNode": HTTensorInfoNode,
     
     # Layer Management
     "HTLayerCollectorNode": HTLayerCollectorNode,
@@ -87,20 +113,22 @@ NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     
     # Utility and Control
     "HTSwitchNode": HTSwitchNode,
+    "HTStatusIndicatorNode": HTStatusIndicatorNode,
     "HTConversionNode": HTConversionNode,
     "HTValueMapperNode": HTValueMapperNode,
     "HTFlexibleNode": HTFlexibleNode,
     "HTInspectorNode": HTInspectorNode,
     "HTWidgetControlNode": HTWidgetControlNode,
+    "HTSplitterNode": HTSplitterNode,
+    "HTNodeStateController": HTNodeStateController,
+    "HTNodeUnmuteAll": HTNodeUnmuteAll,
+    "HTNullNode": HTNullNode,
     
     # Model Management
     "HTDiffusionLoaderMulti": HTDiffusionLoaderMulti
 }
 
-#------------------------------------------------------------------------------
-# Section 4: Display Name Mappings
-#------------------------------------------------------------------------------
-NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
+NODE_DISPLAY_NAME_MAPPINGS = {
     # Text Processing
     "HTRegexNode": "HT Regex",
     "HTParameterExtractorNode": "HT Parameter Extractor",
@@ -108,6 +136,7 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     
     # Image Processing
     "HTSurfaceBlurNode": "HT Surface Blur",
+    "HTResolutionDownsampleNode": "HT Resolution Downsample",
     "HTPhotoshopBlurNode": "HT Photoshop Blur",
     "HTLevelsNode": "HT Levels",
     "HTResizeNode": "HT Smart Resize",
@@ -118,6 +147,8 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "HTDimensionFormatterNode": "HT Dimension Formatter",
     "HTDimensionAnalyzerNode": "HT Dimension Analyzer",
     "HTTrainingSizeNode": "HT Training Size",
+    "HTMaskDilationNode": "HT Mask Dilate",
+    "HTTensorInfoNode": "HT Tensor Info",
     
     # Layer Management
     "HTLayerCollectorNode": "HT Layer Collector",
@@ -131,17 +162,22 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     
     # Utility and Control
     "HTSwitchNode": "HT Switch",
+    "HTStatusIndicatorNode": "HT Status Indicator",
     "HTConversionNode": "HT Conversion",
     "HTValueMapperNode": "HT Value Mapper",
     "HTFlexibleNode": "HT Flexible",
     "HTInspectorNode": "HT Inspector",
     "HTWidgetControlNode": "HT Widget Control",
+    "HTSplitterNode": "HT Splitter",
+    "HTNodeStateController": "HT Node State Controller",
+    "HTNodeUnmuteAll": "HT Unmute All",
+    "HTNullNode": "HT Null Value",
     
     # Model Management
     "HTDiffusionLoaderMulti": "HT Multi Model Loader"
 }
 
 #------------------------------------------------------------------------------
-# Section 5: Exports
+# Section 4: Exports
 #------------------------------------------------------------------------------
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

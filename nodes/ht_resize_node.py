@@ -1,17 +1,51 @@
 """
 File: homage_tools/nodes/ht_resize_node.py
-Version: 1.1.0
-Description: Node for intelligent image and latent resizing with Lanczos interpolation
+Description: Node for intelligent image and latent resizing with proper BHWC handling
+Version: 1.2.0
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Union, Tuple, Dict, Optional
+from typing import Dict, Any, Tuple, Optional
+import logging
 
+logger = logging.getLogger('HommageTools')
+
+#------------------------------------------------------------------------------
+# Section 1: Constants
+#------------------------------------------------------------------------------
+VERSION = "1.2.0"
+
+#------------------------------------------------------------------------------
+# Section 2: Helper Functions
+#------------------------------------------------------------------------------
+def verify_tensor_dimensions(tensor: torch.Tensor, context: str) -> Tuple[int, int, int, int]:
+    """Verify and extract tensor dimensions."""
+    shape = tensor.shape
+    print(f"{context} - Shape: {shape}")
+    
+    if len(shape) == 3:
+        height, width, channels = shape
+        batch = 1
+        print(f"{context} - HWC format detected")
+    elif len(shape) == 4:
+        batch, height, width, channels = shape
+        print(f"{context} - BHWC format detected")
+    else:
+        raise ValueError(f"Invalid shape: {shape}")
+        
+    print(f"{context} - Dims: {batch}x{height}x{width}x{channels}")
+    return batch, height, width, channels
+
+def get_nearest_divisible_size(size: int, divisor: int) -> int:
+    """Calculate nearest size divisible by divisor."""
+    return ((size + divisor - 1) // divisor) * divisor
+
+#------------------------------------------------------------------------------
+# Section 3: Node Definition
+#------------------------------------------------------------------------------
 class HTResizeNode:
-    """
-    Provides advanced resizing for images and latents with extended interpolation modes.
-    """
+    """Smart resize node with format verification."""
     
     CATEGORY = "HommageTools"
     RETURN_TYPES = ("IMAGE", "LATENT")
@@ -46,34 +80,116 @@ class HTResizeNode:
             }
         }
 
-    def get_nearest_divisible_size(self, size: int, divisor: int) -> int:
-        """Calculate nearest size divisible by divisor."""
-        return ((size + divisor - 1) // divisor) * divisor
+    def resize_media(
+        self,
+        divisible_by: str,
+        interpolation: str,
+        scaling_mode: str,
+        crop_or_pad_mode: str,
+        image: Optional[torch.Tensor] = None,
+        latent: Optional[Dict[str, torch.Tensor]] = None
+    ) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+        """Main resize function with tensor verification."""
+        print(f"\nHTResizeNode v{VERSION} - Processing")
+        
+        result_image = None
+        result_latent = None
+        divisor = int(divisible_by)
+
+        if image is not None:
+            print("\nProcessing Image:")
+            batch, height, width, channels = verify_tensor_dimensions(image, "Input Image")
+            print(f"Value range: min={image.min():.3f}, max={image.max():.3f}")
+
+            # Convert to BCHW for interpolation
+            x = image.permute(0, 3, 1, 2)
+            print("Converted to BCHW for processing")
+
+            # Calculate target size
+            target_width, target_height = self.calculate_target_dimensions(
+                width, height, divisor, scaling_mode
+            )
+            print(f"Target size: {target_width}x{target_height}")
+
+            # Apply interpolation
+            processed = F.interpolate(
+                x,
+                size=(target_height, target_width),
+                mode=interpolation if interpolation != 'lanczos' else 'bicubic',
+                antialias=True if interpolation in ['bilinear', 'bicubic', 'lanczos'] else None,
+                align_corners=False if interpolation in ['linear', 'bilinear', 'bicubic'] else None
+            )
+
+            # Convert back to BHWC
+            processed = processed.permute(0, 2, 3, 1)
+            print("Converted back to BHWC")
+
+            # Apply cropping/padding
+            result_image = self.apply_crop_or_pad(
+                processed, target_width, target_height, crop_or_pad_mode
+            )
+
+            print(f"Output shape: {result_image.shape}")
+            print(f"Value range: min={result_image.min():.3f}, max={result_image.max():.3f}")
+
+        if latent is not None:
+            print("\nProcessing Latent:")
+            latent_tensor = latent["samples"]
+            batch, height, width, channels = verify_tensor_dimensions(latent_tensor, "Input Latent")
+
+            # Scale dimensions (latents are 1/8 size)
+            width *= 8
+            height *= 8
+            target_width, target_height = self.calculate_target_dimensions(
+                width, height, divisor, scaling_mode
+            )
+            target_width //= 8
+            target_height //= 8
+            print(f"Scaled target size: {target_width}x{target_height}")
+
+            # Process similar to image
+            x = latent_tensor.permute(0, 3, 1, 2)
+            processed = F.interpolate(
+                x,
+                size=(target_height, target_width),
+                mode=interpolation if interpolation != 'lanczos' else 'bicubic',
+                antialias=True if interpolation in ['bilinear', 'bicubic', 'lanczos'] else None,
+                align_corners=False if interpolation in ['linear', 'bilinear', 'bicubic'] else None
+            )
+            processed = processed.permute(0, 2, 3, 1)
+
+            result_latent = {"samples": self.apply_crop_or_pad(
+                processed, target_width, target_height, crop_or_pad_mode
+            )}
+
+            print(f"Output latent shape: {result_latent['samples'].shape}")
+
+        return (result_image, result_latent)
 
     def calculate_target_dimensions(
         self, 
-        current_width: int, 
-        current_height: int, 
+        width: int,
+        height: int,
         divisor: int,
         scaling_mode: str
     ) -> Tuple[int, int]:
-        """Calculate dimensions maintaining aspect ratio."""
-        aspect_ratio = current_width / current_height
+        """Calculate target dimensions with divisibility."""
+        aspect_ratio = width / height
         
         if scaling_mode == "short_side":
-            if current_height < current_width:
-                new_height = self.get_nearest_divisible_size(current_height, divisor)
-                new_width = self.get_nearest_divisible_size(int(new_height * aspect_ratio), divisor)
+            if height < width:
+                new_height = get_nearest_divisible_size(height, divisor)
+                new_width = get_nearest_divisible_size(int(new_height * aspect_ratio), divisor)
             else:
-                new_width = self.get_nearest_divisible_size(current_width, divisor)
-                new_height = self.get_nearest_divisible_size(int(new_width / aspect_ratio), divisor)
+                new_width = get_nearest_divisible_size(width, divisor)
+                new_height = get_nearest_divisible_size(int(new_width / aspect_ratio), divisor)
         else:
-            if current_height > current_width:
-                new_height = self.get_nearest_divisible_size(current_height, divisor)
-                new_width = self.get_nearest_divisible_size(int(new_height * aspect_ratio), divisor)
+            if height > width:
+                new_height = get_nearest_divisible_size(height, divisor)
+                new_width = get_nearest_divisible_size(int(new_height * aspect_ratio), divisor)
             else:
-                new_width = self.get_nearest_divisible_size(current_width, divisor)
-                new_height = self.get_nearest_divisible_size(int(new_width / aspect_ratio), divisor)
+                new_width = get_nearest_divisible_size(width, divisor)
+                new_height = get_nearest_divisible_size(int(new_width / aspect_ratio), divisor)
                 
         return new_width, new_height
 
@@ -84,8 +200,8 @@ class HTResizeNode:
         target_height: int,
         mode: str
     ) -> torch.Tensor:
-        """Apply cropping or padding based on mode."""
-        current_height, current_width = tensor.shape[-2:]
+        """Apply cropping or padding while maintaining BHWC format."""
+        current_height, current_width = tensor.shape[1:3]
         
         if current_height == target_height and current_width == target_width:
             return tensor
@@ -111,90 +227,9 @@ class HTResizeNode:
             else:
                 pad_left, pad_right = max(0, target_width - current_width), 0
 
-        # Apply padding if needed
         if pad_left + pad_right + pad_top + pad_bottom > 0:
             padding = (pad_left, pad_right, pad_top, pad_bottom)
+            print(f"Applying padding: {padding}")
             tensor = F.pad(tensor, padding, mode='constant', value=0)
 
         return tensor
-
-    def resize_media(
-        self,
-        divisible_by: str,
-        interpolation: str,
-        scaling_mode: str,
-        crop_or_pad_mode: str,
-        image: Optional[torch.Tensor] = None,
-        latent: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
-        """Main resizing function."""
-        divisor = int(divisible_by)
-        result_image = None
-        result_latent = None
-        
-        if image is not None:
-            current_height, current_width = image.shape[-2:]
-            target_width, target_height = self.calculate_target_dimensions(
-                current_width, current_height, divisor, scaling_mode
-            )
-            
-            needs_unsqueeze = len(image.shape) == 3
-            if needs_unsqueeze:
-                image = image.unsqueeze(0)
-            
-            # Special handling for lanczos interpolation
-            if interpolation == 'lanczos':
-                result_image = F.interpolate(
-                    image,
-                    size=(target_height, target_width),
-                    mode='bicubic',  # Torch doesn't have native Lanczos, so we use bicubic as closest approximation
-                    align_corners=False
-                )
-            else:
-                result_image = F.interpolate(
-                    image,
-                    size=(target_height, target_width),
-                    mode=interpolation,
-                    align_corners=False if interpolation in ["linear", "bilinear", "bicubic"] else None
-                )
-            
-            if needs_unsqueeze:
-                result_image = result_image.squeeze(0)
-                
-            result_image = self.apply_crop_or_pad(
-                result_image, target_width, target_height, crop_or_pad_mode
-            )
-            
-        if latent is not None:
-            latent_tensor = latent["samples"]
-            current_height, current_width = latent_tensor.shape[-2:]
-            
-            target_width, target_height = self.calculate_target_dimensions(
-                current_width * 8, current_height * 8, divisor, scaling_mode
-            )
-            target_width = target_width // 8
-            target_height = target_height // 8
-            
-            # Special handling for lanczos interpolation in latents
-            if interpolation == 'lanczos':
-                resized_latent = F.interpolate(
-                    latent_tensor,
-                    size=(target_height, target_width),
-                    mode='bicubic',  # Torch doesn't have native Lanczos, so we use bicubic as closest approximation
-                    align_corners=False
-                )
-            else:
-                resized_latent = F.interpolate(
-                    latent_tensor,
-                    size=(target_height, target_width),
-                    mode=interpolation,
-                    align_corners=False if interpolation in ["linear", "bilinear", "bicubic"] else None
-                )
-            
-            resized_latent = self.apply_crop_or_pad(
-                resized_latent, target_width, target_height, crop_or_pad_mode
-            )
-            
-            result_latent = {"samples": resized_latent}
-        
-        return (result_image, result_latent)

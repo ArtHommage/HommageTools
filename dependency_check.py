@@ -1,155 +1,165 @@
 """
 File: ComfyUI-HommageTools/dependency_check.py
-Version: 1.1.0
-Description: Comprehensive dependency validation for HommageTools
-
-Sections:
-1. Imports and Constants
-2. Version Validation Functions
-3. Main Dependency Check Function
-4. Error Handling
+Version: 1.0.2
+Description: Dependency validation for HommageTools with cleaner warning output
 """
 
-#------------------------------------------------------------------------------
-# Section 1: Imports and Constants
-#------------------------------------------------------------------------------
 import importlib
 from typing import Dict, Tuple, List
 import logging
 
-# Configure logging
 logger = logging.getLogger('HommageTools')
 
-# Define required packages and their minimum versions
+#------------------------------------------------------------------------------
+# Section 1: Dependency Definitions
+#------------------------------------------------------------------------------
 REQUIRED_PACKAGES = {
     'torch': {
         'min_version': '2.0.0',
-        'reason': 'Required for tensor operations and image processing'
+        'reason': 'Required for tensor operations'
     },
     'numpy': {
         'min_version': '1.22.0',
-        'reason': 'Required for array operations and image processing'
+        'reason': 'Required for array operations'
     },
     'PIL': {
         'min_version': '9.0.0',
-        'reason': 'Required for image processing and format conversions'
+        'reason': 'Required for image processing'
     },
     'tifffile': {
         'min_version': '2023.3.15',
-        'reason': 'Required for TIFF file export functionality'
+        'reason': 'Required for TIFF export'
     },
     'psd_tools': {
         'min_version': '1.9.24',
-        'reason': 'Required for PSD file export functionality'
+        'reason': 'Required for PSD export'
+    }
+}
+
+OPTIONAL_PACKAGES = {
+    'oidn': {
+        'min_version': '2.0.0',
+        'reason': 'Intel denoising features will be disabled'
     }
 }
 
 #------------------------------------------------------------------------------
-# Section 2: Version Validation Functions
+# Section 2: Version Checking
 #------------------------------------------------------------------------------
 def parse_version(version_str: str) -> Tuple[int, ...]:
-    """
-    Parse version string into comparable tuple.
-    
-    Args:
-        version_str: Version string (e.g., '1.2.3')
-        
-    Returns:
-        Tuple[int, ...]: Version numbers as tuple
-    """
-    return tuple(map(int, version_str.split('.')))
-
-def check_version_requirement(
-    package_name: str,
-    current_version: str,
-    required_version: str
-) -> bool:
-    """
-    Check if package version meets minimum requirement.
-    
-    Args:
-        package_name: Name of the package
-        current_version: Installed version
-        required_version: Minimum required version
-        
-    Returns:
-        bool: True if version requirement is met
-    """
+    """Parse version string into comparable tuple."""
     try:
-        current = parse_version(current_version)
-        required = parse_version(required_version)
-        return current >= required
-    except ValueError as e:
-        logger.error(f"Error parsing version for {package_name}: {str(e)}")
+        # Handle CUDA version suffix
+        version_str = version_str.split('+')[0]
+        return tuple(map(int, version_str.split('.')))
+    except Exception:
+        return (0,)
+
+def check_version(current: str, required: str) -> bool:
+    """Check if current version meets minimum requirement."""
+    try:
+        current_parts = parse_version(current)
+        required_parts = parse_version(required)
+        return current_parts >= required_parts
+    except Exception:
         return False
 
 #------------------------------------------------------------------------------
-# Section 3: Main Dependency Check Function
+# Section 3: Dependency Validation
 #------------------------------------------------------------------------------
-def check_dependencies() -> Tuple[bool, List[str]]:
+def check_dependencies() -> Tuple[bool, List[str], List[str]]:
     """
-    Check if all required dependencies are available with correct versions.
+    Check all required and optional dependencies.
     
     Returns:
-        Tuple[bool, List[str]]: (success, list of error messages)
+        Tuple[bool, List[str], List[str]]: Success flag, error messages, warning messages
     """
-    missing_packages = []
-    version_issues = []
+    errors = []
+    warnings = []
     
-    for package_name, requirements in REQUIRED_PACKAGES.items():
+    # Check required packages
+    for package, requirements in REQUIRED_PACKAGES.items():
         try:
-            # Special case for Pillow
-            if package_name == 'PIL':
+            if package == 'PIL':
                 module = importlib.import_module('PIL')
-                version = module.__version__
             else:
-                module = importlib.import_module(package_name)
-                version = getattr(module, '__version__', 'unknown')
+                module = importlib.import_module(package)
+                
+            version = getattr(module, '__version__', 'unknown')
+            min_version = requirements['min_version']
             
-            # Check version if available
-            if version != 'unknown':
-                if not check_version_requirement(
-                    package_name,
-                    version,
-                    requirements['min_version']
-                ):
-                    version_issues.append(
-                        f"{package_name}: Installed version {version} is below "
-                        f"required version {requirements['min_version']}. "
-                        f"Reason: {requirements['reason']}"
-                    )
+            if version == 'unknown':
+                errors.append(f"Could not determine version for {package}")
+                continue
+                
+            if not check_version(version, min_version):
+                errors.append(
+                    f"{package} version {version} is below required {min_version}. "
+                    f"Reason: {requirements['reason']}"
+                )
+                
         except ImportError:
-            missing_packages.append(
-                f"{package_name}: Not installed. "
+            errors.append(
+                f"Missing required package: {package}. "
                 f"Reason: {requirements['reason']}"
             )
-
-    # Combine all issues
-    all_issues = missing_packages + version_issues
-    success = len(all_issues) == 0
     
-    # Log results
-    if success:
-        logger.info("All dependencies validated successfully")
-    else:
-        for issue in all_issues:
-            logger.error(issue)
+    # Check optional packages
+    for package, requirements in OPTIONAL_PACKAGES.items():
+        try:
+            module = importlib.import_module(package)
+            version = getattr(module, '__version__', 'unknown')
+            min_version = requirements['min_version']
+            
+            if version == 'unknown':
+                warnings.append(f"{package}: Version check skipped. {requirements['reason']}")
+                continue
+                
+            if not check_version(version, min_version):
+                warnings.append(
+                    f"{package} version {version} is below recommended {min_version}. "
+                    f"{requirements['reason']}"
+                )
+                
+        except ImportError:
+            warnings.append(f"{package} not found. {requirements['reason']}")
     
-    return success, all_issues
+    return len(errors) == 0, errors, warnings
 
 #------------------------------------------------------------------------------
-# Section 4: Error Handling
+# Section 4: Error Formatting
 #------------------------------------------------------------------------------
-def validate_environment() -> None:
+def format_messages(title: str, messages: List[str]) -> str:
+    """Format dependency messages into readable format."""
+    if not messages:
+        return ""
+    formatted = [f"\n{title}"]
+    for msg in messages:
+        formatted.append(f"  • {msg}")
+    return "\n".join(formatted)
+
+#------------------------------------------------------------------------------
+# Section 5: Main Validation Function
+#------------------------------------------------------------------------------
+def validate_environment(silent: bool = False) -> None:
     """
-    Validate environment and raise informative error if dependencies missing.
+    Validate environment and raise error if required dependencies missing.
+    Will log warnings for optional dependencies.
     
+    Args:
+        silent: If True, suppress warning messages to stdout
+        
     Raises:
-        ImportError: If any dependencies are missing or version requirements not met
+        ImportError: If any required dependencies are missing or invalid
     """
-    success, issues = check_dependencies()
+    success, errors, warnings = check_dependencies()
+    
+    # Log warnings for optional packages
+    if warnings and not silent:
+        warning_msg = format_messages("Optional Dependencies:", warnings)
+        logger.info(warning_msg)  # Use info level since these are optional
+    
+    # Raise error if required dependencies fail
     if not success:
-        raise ImportError(
-            "HommageTools dependency validation failed:\n" +
-            "\n".join(f"- {issue}" for issue in issues)
-        )
+        error_msg = format_messages("Required Dependencies Failed:", errors)
+        raise ImportError(error_msg)

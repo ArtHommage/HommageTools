@@ -1,15 +1,56 @@
 """
 File: homage_tools/nodes/ht_levels_node.py
-Version: 1.1.1
 Description: Node for levels correction using reference images with BHWC format handling
+Version: 1.2.0
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
+import logging
 
+logger = logging.getLogger('HommageTools')
+
+#------------------------------------------------------------------------------
+# Section 1: Constants
+#------------------------------------------------------------------------------
+VERSION = "1.2.0"
+
+#------------------------------------------------------------------------------
+# Section 2: Helper Functions
+#------------------------------------------------------------------------------
+def verify_tensor_format(tensor: torch.Tensor, context: str) -> None:
+    """Verify tensor format and dimensions."""
+    shape = tensor.shape
+    print(f"{context} - Shape: {shape}")
+    if len(shape) == 3:  # HWC
+        print(f"{context} - HWC format detected")
+        print(f"Dims: {shape[0]}x{shape[1]}x{shape[2]}")
+    elif len(shape) == 4:  # BHWC
+        print(f"{context} - BHWC format detected")
+        print(f"Dims: {shape[0]}x{shape[1]}x{shape[2]}x{shape[3]}")
+    else:
+        raise ValueError(f"Invalid tensor shape: {shape}")
+    print(f"Value range: min={tensor.min():.3f}, max={tensor.max():.3f}")
+
+def compute_histogram(image: torch.Tensor, num_bins: int = 256) -> torch.Tensor:
+    """Compute histogram for each channel in BHWC format."""
+    print(f"Computing histogram: shape={image.shape}, bins={num_bins}")
+    hist = torch.zeros(image.shape[-1], num_bins, device=image.device)
+    
+    for i in range(image.shape[-1]):
+        channel = image[..., i]
+        bins = torch.histc(channel, bins=num_bins, min=0, max=1)
+        hist[i] = bins
+    
+    print(f"Histogram shape: {hist.shape}")
+    return hist
+
+#------------------------------------------------------------------------------
+# Section 3: Node Definition
+#------------------------------------------------------------------------------
 class HTLevelsNode:
-    """Provides image levels correction using reference images."""
+    """Levels correction using reference images."""
     
     CATEGORY = "HommageTools"
     FUNCTION = "process_levels"
@@ -22,10 +63,10 @@ class HTLevelsNode:
             "required": {
                 "source_image": ("IMAGE",),
                 "reference_image": ("IMAGE",),
-                "method": (["luminance_curve", "histogram_match"], {
-                    "default": "luminance_curve"
+                "method": (["histogram_match", "luminance_curve"], {
+                    "default": "histogram_match"
                 }),
-                "adjustment_strength": ("FLOAT", {
+                "strength": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
                     "max": 2.0,
@@ -34,26 +75,20 @@ class HTLevelsNode:
             }
         }
 
-    def _compute_histogram(self, image: torch.Tensor) -> torch.Tensor:
-        """Compute histogram for each channel in BHWC format."""
-        # image shape: [B,H,W,C]
-        hist = torch.zeros(image.shape[-1], 256, device=image.device)
-        for i in range(image.shape[-1]):
-            channel = image[..., i]
-            bins = torch.histc(channel, bins=256, min=0, max=1)
-            hist[i] = bins
-        return hist
-
-    def _apply_levels(
+    def apply_histogram_matching(
         self,
-        source: torch.Tensor,  # [B,H,W,C]
-        reference: torch.Tensor,  # [B,H,W,C]
+        source: torch.Tensor,
+        reference: torch.Tensor,
         strength: float = 1.0
     ) -> torch.Tensor:
-        """Apply levels adjustment using BHWC tensors."""
-        # Compute histograms (source shape: [B,H,W,C])
-        source_hist = self._compute_histogram(source[0])  # Use first batch item
-        ref_hist = self._compute_histogram(reference[0])
+        """Apply histogram matching with proper BHWC handling."""
+        print("\nApplying histogram matching:")
+        verify_tensor_format(source, "Source")
+        verify_tensor_format(reference, "Reference")
+        
+        # Compute histograms
+        source_hist = compute_histogram(source[0])
+        ref_hist = compute_histogram(reference[0])
         
         # Compute CDFs
         source_cdf = torch.cumsum(source_hist, dim=1)
@@ -62,12 +97,13 @@ class HTLevelsNode:
         # Normalize CDFs
         source_cdf = source_cdf / source_cdf[:, -1:].clamp(min=1e-5)
         ref_cdf = ref_cdf / ref_cdf[:, -1:].clamp(min=1e-5)
+        print("CDFs computed and normalized")
         
         # Create lookup indices
-        indices = torch.arange(256, device=source.device).float() / 255.0
+        indices = torch.linspace(0, 1, 256, device=source.device)
         indices = indices.view(1, -1).expand(source.shape[-1], -1)
         
-        # Find matching values
+        # Match histograms
         matched = torch.zeros_like(indices)
         for i in range(source.shape[-1]):
             source_vals = source_cdf[i]
@@ -83,45 +119,53 @@ class HTLevelsNode:
         if strength != 1.0:
             matched = indices + (matched - indices) * strength
         
-        # Apply correction (maintaining BHWC format)
+        # Apply correction
         result = torch.zeros_like(source)
-        for b in range(source.shape[0]):  # Process each batch
-            for i in range(source.shape[-1]):  # Process each channel
+        for b in range(source.shape[0]):
+            for i in range(source.shape[-1]):
                 channel = source[b, ..., i]
                 scaled = (channel * 255).long().clamp(0, 255)
-                correction = matched[i][scaled]
-                result[b, ..., i] = correction
-            
+                result[b, ..., i] = matched[i][scaled]
+        
+        print(f"Output shape: {result.shape}")
+        print(f"Value range: min={result.min():.3f}, max={result.max():.3f}")
         return result
 
     def process_levels(
         self,
-        source_image: torch.Tensor,  # [B,H,W,C] or [H,W,C]
-        reference_image: torch.Tensor,  # [B,H,W,C] or [H,W,C]
+        source_image: torch.Tensor,
+        reference_image: torch.Tensor,
         method: str,
-        adjustment_strength: float
+        strength: float
     ) -> Tuple[torch.Tensor]:
-        """Process image levels using reference in BHWC format."""
+        """Process image levels with proper format handling."""
+        print(f"\nHTLevelsNode v{VERSION} - Processing")
+        
         try:
-            # Handle batch dimension
+            # Ensure BHWC format
             if len(source_image.shape) == 3:
                 source_image = source_image.unsqueeze(0)
             if len(reference_image.shape) == 3:
                 reference_image = reference_image.unsqueeze(0)
-                
-            # Apply levels correction
-            output = self._apply_levels(
-                source_image,
-                reference_image,
-                adjustment_strength
-            )
             
-            # Remove batch dim if input wasn't batched
+            # Process based on method
+            if method == "histogram_match":
+                output = self.apply_histogram_matching(
+                    source_image,
+                    reference_image,
+                    strength
+                )
+            else:  # luminance_curve
+                # TODO: Implement luminance curve method
+                output = source_image
+            
+            # Restore original dimensions
             if len(source_image.shape) == 3:
                 output = output.squeeze(0)
-                
+            
             return (output,)
             
         except Exception as e:
-            print(f"Error in HTLevelsNode: {str(e)}")
+            logger.error(f"Error in levels processing: {str(e)}")
+            print(f"Error: {str(e)}")
             return (source_image,)
