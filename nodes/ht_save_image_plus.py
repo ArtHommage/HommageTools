@@ -1,6 +1,6 @@
 """
 File: homage_tools/nodes/ht_save_image_plus.py
-Version: 1.0.0
+Version: 1.1.0
 Description: Enhanced image saving node with multiple format support, mask handling, and text output capabilities
 
 Sections:
@@ -16,8 +16,7 @@ Sections:
 #------------------------------------------------------------------------------
 import os
 import json
-from PIL import Image 
-from PIL.PngInfo import PngInfo
+from PIL import Image, PngImagePlugin
 import numpy as np
 import torch
 import logging
@@ -25,6 +24,8 @@ import folder_paths
 from typing import Dict, Any, Tuple, Optional, Union
 
 logger = logging.getLogger('HommageTools')
+
+VERSION = "1.1.0"
 
 #------------------------------------------------------------------------------
 # Section 2: Helper Functions
@@ -69,7 +70,7 @@ class HTSaveImagePlus:
     OUTPUT_NODE = True
     
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {"required": {
                 "images": ("IMAGE", {
                     "tooltip": "Images in BHWC format to save"
@@ -124,6 +125,11 @@ class HTSaveImagePlus:
                 "text_encoding": (["UTF-8", "ASCII", "UTF-16", "UTF-32"], {
                     "default": "UTF-8",
                     "tooltip": "Text file encoding"
+                }),
+                # Metadata control
+                "save_metadata": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Save prompt metadata in PNG files"
                 })
             },
             "hidden": {
@@ -168,7 +174,7 @@ class HTSaveImagePlus:
         file_path: str,
         format: str,
         save_alpha: bool = True,
-        metadata: Optional[PngInfo] = None,
+        metadata: Optional[dict] = None,
         **kwargs
     ) -> bool:
         """Save image with specified format and options."""
@@ -177,7 +183,17 @@ class HTSaveImagePlus:
                 image = image.convert('RGB')
                 
             if format == "PNG":
-                image.save(file_path, format='PNG', pnginfo=metadata)
+                # Create new PngInfo for metadata if needed
+                # Create metadata for PNG if needed
+                png_info = None
+                if metadata and kwargs.get('save_metadata', True):
+                    png_info = PngImagePlugin.PngInfo()
+                    for k, v in metadata.items():
+                        if isinstance(v, dict) or isinstance(v, list):
+                            v = json.dumps(v)
+                        png_info.add_text(str(k), str(v))
+
+                image.save(file_path, format='PNG', pnginfo=png_info)
             elif format == "JPEG":
                 # JPEG doesn't support alpha, always convert
                 if image.mode == 'RGBA':
@@ -211,9 +227,13 @@ class HTSaveImagePlus:
         tiff_compression: str = "adobe_deflate",
         text_content: Optional[str] = None,
         text_extension: str = ".txt",
-        text_encoding: str = "UTF-8"
+        text_encoding: str = "UTF-8",
+        save_metadata: bool = True
     ) -> Dict:
         """Process and save images with optional mask and text output."""
+        print(f"\nHTSaveImagePlus v{VERSION} - Processing")
+        print(f"Target directory: {output_dir}")
+        print(f"Format: {output_format}, Sequence numbering: {'Enabled' if add_sequence_number else 'Disabled'}")
         
         # Ensure output directory exists
         if not ensure_directory_exists(output_dir):
@@ -223,13 +243,12 @@ class HTSaveImagePlus:
         
         # Prepare metadata for PNG
         metadata = None
-        if output_format == "PNG" and not args.disable_metadata:
-            metadata = PngInfo()
+        if output_format == "PNG" and save_metadata:
+            metadata = {}
             if prompt is not None:
-                metadata.add_text("prompt", json.dumps(prompt))
+                metadata["prompt"] = prompt
             if extra_pnginfo is not None:
-                for k, v in extra_pnginfo.items():
-                    metadata.add_text(k, json.dumps(v))
+                metadata.update(extra_pnginfo)
 
         # Process each image in batch
         for idx, image in enumerate(images):
@@ -244,7 +263,12 @@ class HTSaveImagePlus:
                 counter = idx
             
             # Get mask for this image if provided
-            current_mask = mask[idx] if mask is not None else None
+            current_mask = None
+            if mask is not None:
+                if len(mask.shape) == 4:  # BHWC format
+                    current_mask = mask[idx] if idx < mask.shape[0] else mask[0]
+                else:  # Single mask for all images
+                    current_mask = mask
             
             # Convert and save image
             pil_image = self._prepare_image(image, current_mask)
@@ -255,8 +279,12 @@ class HTSaveImagePlus:
                 save_alpha=save_alpha,
                 metadata=metadata,
                 jpeg_quality=jpeg_quality,
-                tiff_compression=tiff_compression
+                tiff_compression=tiff_compression,
+                save_metadata=save_metadata
             ):
+                # Log successful image save to console
+                print(f"Successfully saved image: {file_path}")
+                
                 results.append({
                     "filename": os.path.basename(file_path),
                     "subfolder": os.path.relpath(output_dir, folder_paths.get_output_directory()),
@@ -266,7 +294,9 @@ class HTSaveImagePlus:
                 # Save accompanying text file if provided
                 if text_content:
                     text_path = os.path.splitext(file_path)[0] + text_extension
-                    if not write_text_file(text_path, text_content, text_encoding):
+                    if write_text_file(text_path, text_content, text_encoding):
+                        print(f"Successfully saved text file: {text_path}")
+                    else:
                         logger.warning(f"Failed to save text file for image {file_path}")
 
         return {"ui": {"images": results}}

@@ -1,7 +1,7 @@
 """
 File: homage_tools/nodes/ht_surface_blur_node.py
 Description: Memory-efficient surface blur with tiled processing and CUDA optimization
-Version: 1.4.1
+Version: 1.4.2
 
 Sections:
 1. Imports and Configuration
@@ -21,7 +21,7 @@ import math
 import logging
 
 logger = logging.getLogger('HommageTools')
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 #------------------------------------------------------------------------------
 # Section 2: Memory Management Functions
@@ -89,32 +89,11 @@ def get_optimal_tile_size(
 #------------------------------------------------------------------------------
 # Section 3: Tensor Validation and Debug
 #------------------------------------------------------------------------------
-def debug_tensor_stats(tensor: torch.Tensor, name: str) -> None:
-    """Print debug statistics for tensor values and format."""
-    shape = tensor.shape
-    print(f"\nDebug {name}:")
-    print(f"Shape: {shape}")
-    
-    if len(shape) == 3:  # HWC
-        print(f"Format: HWC")
-        print(f"Dimensions: {shape[0]}x{shape[1]}")
-        print(f"Channels: {shape[2]}")
-    elif len(shape) == 4:  # BHWC
-        print(f"Format: BHWC")
-        print(f"Dimensions: {shape[1]}x{shape[2]}")
-        print(f"Batch: {shape[0]}, Channels: {shape[3]}")
-        
-    print(f"Value range: min={tensor.min().item():.3f}, max={tensor.max().item():.3f}")
-    if torch.isnan(tensor).any():
-        print("WARNING: Contains NaN values")
-    if torch.isinf(tensor).any():
-        print("WARNING: Contains Inf values")
-
 def verify_tensor_format(tensor: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, int]]:
     """Verify and normalize tensor to BHWC format."""
     if len(tensor.shape) == 3:  # HWC
         tensor = tensor.unsqueeze(0)  # Add batch dimension
-        print("Converted HWC to BHWC format")
+        logger.debug("Converted HWC to BHWC format")
         
     if len(tensor.shape) != 4:
         raise ValueError(f"Invalid tensor shape: {tensor.shape}")
@@ -137,8 +116,6 @@ def process_tile(
     device: torch.device
 ) -> torch.Tensor:
     """Process a single tile with surface blur."""
-    debug_tensor_stats(tile, "Input Tile")
-    
     # Ensure BHWC format
     tile, dims = verify_tensor_format(tile)
     tile = tile.to(device)
@@ -156,11 +133,9 @@ def process_tile(
         channels = []
         for c in range(dims['channels']):
             channel = tile[..., c:c+1]
-            print(f"Processing channel {c}: shape={channel.shape}")
             
             # Convert to BCHW for unfold operation
             x = channel.permute(0, 3, 1, 2)
-            print(f"Converted to BCHW: shape={x.shape}")
             
             # Extract patches
             patches = F.unfold(
@@ -193,7 +168,6 @@ def process_tile(
         
         # Combine channels
         result = torch.cat(channels, dim=-1)
-        debug_tensor_stats(result, "Final Tile Output")
         
         return result
         
@@ -239,8 +213,7 @@ class HTSurfaceBlurNode:
         threshold: float
     ) -> Tuple[torch.Tensor]:
         """Apply surface blur with tiled processing."""
-        print(f"\nHTSurfaceBlurNode v{VERSION} - Processing")
-        debug_tensor_stats(image, "Input Image")
+        logger.info(f"HTSurfaceBlurNode v{VERSION} - Processing")
         
         try:
             # Ensure BHWC format
@@ -254,14 +227,14 @@ class HTSurfaceBlurNode:
                 radius,
                 image.dtype
             )
-            print(f"Using tile size: {tile_size}x{tile_size}")
+            logger.info(f"Using tile size: {tile_size}x{tile_size}")
             
             # Normalize threshold to 0-1 range
             threshold = threshold / 255.0
             
             # Set processing device
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            print(f"Processing device: {device}")
+            logger.info(f"Processing device: {device}")
             
             # Initialize output tensor
             result = torch.zeros_like(image)
@@ -273,15 +246,14 @@ class HTSurfaceBlurNode:
             for y in range(0, dims['height'], tile_size):
                 for x in range(0, dims['width'], tile_size):
                     current_tile += 1
-                    print(f"\nProcessing tile {current_tile}/{total_tiles}")
+                    if current_tile % 5 == 0 or current_tile == total_tiles:
+                        logger.info(f"Processing tile {current_tile}/{total_tiles}")
                     
                     # Calculate tile bounds
                     y_end = min(y + tile_size + radius, dims['height'])
                     x_end = min(x + tile_size + radius, dims['width'])
                     y_start = max(0, y - radius)
                     x_start = max(0, x - radius)
-                    
-                    print(f"Tile coordinates: ({x_start}, {y_start}) to ({x_end}, {y_end})")
                     
                     # Extract and process tile
                     tile = image[:, y_start:y_end, x_start:x_end, :]
@@ -302,10 +274,9 @@ class HTSurfaceBlurNode:
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
             
-            debug_tensor_stats(result, "Final Output")
+            logger.info("Surface blur processing complete")
             return (result,)
             
         except Exception as e:
             logger.error(f"Error in surface blur: {str(e)}")
-            print(f"Error details: {str(e)}")
             return (image,)

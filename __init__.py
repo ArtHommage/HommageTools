@@ -1,6 +1,6 @@
 """
 File: ComfyUI-HommageTools/__init__.py
-Version: 1.1.1
+Version: 1.1.2
 Description: Initialization file for HommageTools node collection
 """
 
@@ -37,11 +37,13 @@ from .nodes.ht_text_cleanup_node import HTTextCleanupNode
 
 # Image Processing Nodes
 from .nodes.ht_surface_blur_node import HTSurfaceBlurNode
+from .nodes.ht_downsample_node import HTResolutionDownsampleNode as HTDownsampleNode
 from .nodes.ht_resolution_downsample_node import HTResolutionDownsampleNode
 from .nodes.ht_photoshop_blur_node import HTPhotoshopBlurNode
 from .nodes.ht_levels_node import HTLevelsNode
 from .nodes.ht_resize_node import HTResizeNode
 from .nodes.ht_oidn_node import HTOIDNNode
+from .nodes.ht_save_image_plus import HTSaveImagePlus
 
 # Dimension Handling Nodes
 from .nodes.ht_resolution_node import HTResolutionNode
@@ -72,6 +74,7 @@ from .nodes.ht_splitter_node import HTSplitterNode
 from .nodes.ht_node_state_controller import HTNodeStateController
 from .nodes.ht_node_unmute_all import HTNodeUnmuteAll
 from .nodes.ht_null_node import HTNullNode
+from .nodes.ht_console_logger_node import HTConsoleLoggerNode  # New import
 
 # Model Management Nodes
 from .nodes.ht_diffusion_loader_multi import HTDiffusionLoaderMulti
@@ -87,11 +90,13 @@ NODE_CLASS_MAPPINGS = {
     
     # Image Processing
     "HTSurfaceBlurNode": HTSurfaceBlurNode,
+    "HTDownsampleNode": HTDownsampleNode,
     "HTResolutionDownsampleNode": HTResolutionDownsampleNode,
     "HTPhotoshopBlurNode": HTPhotoshopBlurNode,
     "HTLevelsNode": HTLevelsNode,
     "HTResizeNode": HTResizeNode,
     "HTOIDNNode": HTOIDNNode,
+    "HTSaveImagePlus": HTSaveImagePlus,
     
     # Dimension Handling
     "HTResolutionNode": HTResolutionNode,
@@ -123,6 +128,7 @@ NODE_CLASS_MAPPINGS = {
     "HTNodeStateController": HTNodeStateController,
     "HTNodeUnmuteAll": HTNodeUnmuteAll,
     "HTNullNode": HTNullNode,
+    "HTConsoleLoggerNode": HTConsoleLoggerNode,  # New node registration
     
     # Model Management
     "HTDiffusionLoaderMulti": HTDiffusionLoaderMulti
@@ -136,11 +142,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     
     # Image Processing
     "HTSurfaceBlurNode": "HT Surface Blur",
+    "HTDownsampleNode": "HT Downsample",
     "HTResolutionDownsampleNode": "HT Resolution Downsample",
     "HTPhotoshopBlurNode": "HT Photoshop Blur",
     "HTLevelsNode": "HT Levels",
     "HTResizeNode": "HT Smart Resize",
     "HTOIDNNode": "HT Intel Denoiser",
+    "HTSaveImagePlus": "HT Save Image Plus",
     
     # Dimension Handling
     "HTResolutionNode": "HT Resolution",
@@ -172,6 +180,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HTNodeStateController": "HT Node State Controller",
     "HTNodeUnmuteAll": "HT Unmute All",
     "HTNullNode": "HT Null Value",
+    "HTConsoleLoggerNode": "HT Console Logger",  # New display name
     
     # Model Management
     "HTDiffusionLoaderMulti": "HT Multi Model Loader"
