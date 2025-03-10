@@ -217,52 +217,69 @@ def ensure_bhwc_format(tensor, name="Unknown"):
 # File: homage_tools/nodes/ht_detection_batch_processor.py
 # Version: 1.3.3
 
-def apply_vae_encode(img_for_vae, vae, device):
-    """Safely encode image with VAE handling tensor format issues"""
-    try:
-        # STEP 1: Convert to proper BCHW format with explicit reshape
-        print(f"\n==== VAE ENCODE FUNCTION STARTING ====")
-        print(f"Input shape: {img_for_vae.shape}")
-        
-        # Create a completely new tensor with correct order
-        b = img_for_vae.shape[0]
-        if img_for_vae.shape[3] == 3:  # BHWC format
-            h, w, c = img_for_vae.shape[1], img_for_vae.shape[2], img_for_vae.shape[3]
-            # Extract data and create new tensor with correct shape
-            img_data = img_for_vae.detach().cpu().numpy()
-            # Reshape with channels first (BCHW)
-            img_data = img_data.transpose(0, 3, 1, 2)
-            # Create new tensor
-            bchw_tensor = torch.from_numpy(img_data).to(img_for_vae.device)
-            print(f"Explicitly reshaped to BCHW: {bchw_tensor.shape}")
+def apply_vae_encode(self, image, vae):
+    print("==== VAE ENCODE FUNCTION STARTING ====")
+    print(f"Input shape: {image.shape}")
+    
+    # Ensure input is in the correct format for the VAE (BCHW)
+    if len(image.shape) == 4 and image.shape[1] == 3:
+        # Already in BCHW format, no need for permutation
+        bchw_tensor = image
+        print(f"Image already in correct BCHW format: {bchw_tensor.shape}")
+    else:
+        # Try to convert to proper format if needed
+        print("Input may not be in correct format, attempting to fix...")
+        if len(image.shape) == 4 and image.shape[3] == 3:  # BHWC format
+            bchw_tensor = image.permute(0, 3, 1, 2)
+            print(f"Converted from BHWC to BCHW: {bchw_tensor.shape}")
         else:
-            raise ValueError(f"Expected BHWC format with 3 channels, got shape: {img_for_vae.shape}")
-        
-        # STEP 2: Get VAE device
-        try:
-            vae_device = next(vae.first_stage_model.parameters()).device
-        except:
-            try:
-                # Alternative way to get device
-                vae_device = next(vae.parameters()).device
-            except:
-                vae_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        print(f"VAE device: {vae_device}")
-        bchw_tensor = bchw_tensor.to(vae_device)
-        
-        # STEP 3: Encode with VAE
-        print(f"Final tensor shape for encoding: {bchw_tensor.shape}")
+            bchw_tensor = image
+            print(f"Using original tensor shape: {bchw_tensor.shape}")
+    
+    print(f"VAE device: {vae.device}")
+    print(f"Final tensor shape for encoding: {bchw_tensor.shape}")
+    
+    print(f"Requested to load {type(vae).__name__}")
+    
+    try:
         samples = vae.encode(bchw_tensor)
-        print(f"VAE encoding successful: {samples.shape}")
         
-        return samples
-        
+        # Handle if samples is a dictionary (some VAE implementations return dict)
+        if isinstance(samples, dict) and "samples" in samples:
+            print(f"VAE returned a dictionary, extracting 'samples' key")
+            return samples["samples"]
+        else:
+            print(f"VAE encoding successful: {samples.shape}")
+            return samples
+            
     except Exception as e:
         print(f"VAE encoding error: {e}")
-        import traceback
         traceback.print_exc()
-        raise
+        
+        print(f"VAE encoding failed, trying alternative approach: {e}")
+        
+        # Try direct approach
+        print("Trying direct VAE encode with minimal preprocessing")
+        try:
+            import comfy.model_management as model_management
+            model_management.unload_all_models()
+            print(f"{model_management.OFFLOAD_DEVICE} models unloaded.")
+            
+            # Direct encode
+            latent = vae.encode(bchw_tensor)
+            
+            # Handle dictionary result
+            if isinstance(latent, dict) and "samples" in latent:
+                print(f"Direct VAE encoding returned a dictionary, extracting 'samples' key")
+                latent = latent["samples"]
+                
+            print(f"Direct VAE encoding successful: {latent.shape}")
+            return latent
+            
+        except Exception as e2:
+            print(f"Direct encoding also failed: {e2}")
+            traceback.print_exc()
+            return None
 
 def _direct_vae_encode(img, vae):
     """
@@ -588,38 +605,6 @@ def match_mask_to_proportions(mask: torch.Tensor, target_w: int, target_h: int, 
     
     return resized_mask
 
-def apply_ksampler(model, positive, negative, latent, steps, cfg, sampler_name, scheduler, denoise, seed):
-    """Simple KSampler application that handles device and type issues"""
-    try:
-        # Ensure seed is an integer
-        seed = int(seed) if not isinstance(seed, int) else seed
-        
-        # Use ComfyUI's common_ksampler directly
-        import comfy.sample
-        from nodes import common_ksampler
-        
-        # This avoids the device handling problem by using ComfyUI's built-in function
-        samples, _ = common_ksampler(
-            model=model,
-            seed=seed,
-            steps=steps,
-            cfg=cfg,
-            sampler_name=sampler_name,
-            scheduler=scheduler,
-            positive=positive,
-            negative=negative,
-            latent={"samples": latent},
-            denoise=denoise
-        )
-        
-        return {"samples": samples}
-        
-    except Exception as e:
-        print(f"Error in KSampler: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"samples": latent}
-
 #------------------------------------------------------------------------------
 # Section 5: Main Node Implementation
 #------------------------------------------------------------------------------
@@ -670,6 +655,42 @@ class HTDetectionBatchProcessor:
                 "labels": ("STRING", {"multiline": True, "default": "all", "placeholder": "List types of segments to allow, comma-separated"})
             }
         }
+    
+    def apply_ksampler(self, sampler_name, scheduler, latent, seed, steps, cfg, denoise, upscaler_strength, model, positive, negative):
+        print(f"Applying KSampler with steps={steps}, cfg={cfg}, denoise={denoise}")
+        
+        # Handle if latent is a dictionary
+        if isinstance(latent, dict) and "samples" in latent:
+            print("Converting latent dictionary to samples tensor")
+            latent_samples = latent["samples"]
+        else:
+            latent_samples = latent
+        
+        # Create the proper latent format expected by common_ksampler
+        latent_image = {"samples": latent_samples}
+        
+        try:
+            import comfy.sample
+            from nodes import common_ksampler
+            
+            samples, _ = common_ksampler(
+                model=model,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                positive=positive,
+                negative=negative,
+                latent=latent_image,
+                denoise=denoise if denoise < 1.0 else upscaler_strength,
+            )
+            
+            return samples
+        except Exception as e:
+            print(f"Error in KSampler: {e}")
+            traceback.print_exc()
+            return latent_image
     
     def process(self, image: torch.Tensor, detection_threshold: float, mask_dilation: int, crop_factor:float, drop_size: int, tile_size: int, scale_mode: str, scale_factor: float, divisibility: str, mask_blur: int, overlap: int, model, vae, steps: int, cfg: float, denoise: float, sampler_name: str, scheduler: str, seed: int, bbox_detector=None, upscale_model=None, positive=None, negative=None, labels="all") -> Tuple[List[torch.Tensor], List[torch.Tensor], Any, List[torch.Tensor], Optional[torch.Tensor], int]:
         """
@@ -934,22 +955,29 @@ class HTDetectionBatchProcessor:
                         
                     # Apply KSampler
                     logger.info(f"Applying KSampler with steps={steps}, cfg={cfg}, denoise={denoise}")
-                    sampled_latent = apply_ksampler(
-                        model=model,
-                        positive=positive,
-                        negative=negative,
-                        latent={"samples": vae_samples},
-                        steps=steps,
-                        cfg=cfg,
-                        sampler_name=sampler_name,
-                        scheduler=scheduler,
-                        denoise=denoise,
-                        seed=seed
+                    sampled_latent = self.apply_ksampler(
+                        sampler_name, scheduler, latent, seed, steps, cfg,
+                        denoise, self.upscaler_strength, model, positive, negative
                     )
                         
                     # Decode
                     logger.info("Decoding with VAE...")
-                    decoded = vae.decode(sampled_latent["samples"])
+                    print("Decoding with VAE...")
+                    try:
+                        # Handle if sampled_latent is a dictionary already
+                        if isinstance(sampled_latent, dict) and "samples" in sampled_latent:
+                            decoded = vae.decode(sampled_latent["samples"])
+                        else:
+                            # Create the proper format if it's not already a dictionary
+                            latent_dict = {"samples": sampled_latent}
+                            decoded = vae.decode(latent_dict["samples"])
+                            
+                        # Rest of your decoding logic continues below...
+                        
+                    except Exception as e:
+                        print(f"Error in VAE processing: {e}")
+                        traceback.print_exc()
+                        
                     logger.info(f"Decoded shape: {decoded.shape}")
                         
                     # Convert to BHWC
