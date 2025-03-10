@@ -29,10 +29,6 @@ REQUIRED_PACKAGES = {
     'tifffile': {
         'min_version': '2023.3.15',
         'reason': 'Required for TIFF export'
-    },
-    'psd_tools': {
-        'min_version': '1.9.24',
-        'reason': 'Required for PSD export'
     }
 }
 

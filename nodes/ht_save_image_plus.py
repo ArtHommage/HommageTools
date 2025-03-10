@@ -1,19 +1,9 @@
 """
 File: homage_tools/nodes/ht_save_image_plus.py
-Version: 1.1.0
+Version: 1.2.0
 Description: Enhanced image saving node with multiple format support, mask handling, and text output capabilities
-
-Sections:
-1. Imports and Constants
-2. Helper Functions
-3. Main Node Class
-4. Format Conversion Functions
-5. File Management
 """
 
-#------------------------------------------------------------------------------
-# Section 1: Imports and Constants
-#------------------------------------------------------------------------------
 import os
 import json
 from PIL import Image, PngImagePlugin
@@ -25,10 +15,10 @@ from typing import Dict, Any, Tuple, Optional, Union
 
 logger = logging.getLogger('HommageTools')
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"  # Updated version number
 
 #------------------------------------------------------------------------------
-# Section 2: Helper Functions
+# Section 1: Helper Functions
 #------------------------------------------------------------------------------
 def ensure_directory_exists(directory: str) -> bool:
     """Create directory if it doesn't exist."""
@@ -59,7 +49,7 @@ def write_text_file(file_path: str, content: str, encoding: str = 'UTF-8') -> bo
         return False
 
 #------------------------------------------------------------------------------
-# Section 3: Main Node Class
+# Section 2: Main Node Class
 #------------------------------------------------------------------------------
 class HTSaveImagePlus:
     """Enhanced image saving node with multiple format and mask support."""
@@ -139,7 +129,7 @@ class HTSaveImagePlus:
         }
 
     #--------------------------------------------------------------------------
-    # Section 4: Format Conversion Functions
+    # Section 3: Format Conversion Functions
     #--------------------------------------------------------------------------
     def _prepare_image(self, image: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Image.Image:
         """Convert BHWC tensor to PIL Image, handling alpha channel."""
@@ -183,7 +173,6 @@ class HTSaveImagePlus:
                 image = image.convert('RGB')
                 
             if format == "PNG":
-                # Create new PngInfo for metadata if needed
                 # Create metadata for PNG if needed
                 png_info = None
                 if metadata and kwargs.get('save_metadata', True):
@@ -210,15 +199,15 @@ class HTSaveImagePlus:
             return False
 
     #--------------------------------------------------------------------------
-    # Section 5: Main Processing
+    # Section 4: Main Processing
     #--------------------------------------------------------------------------
     def save_image_plus(
         self,
-        images: torch.Tensor,
-        output_format: str,
-        filename_prefix: str,
-        add_sequence_number: bool,
-        output_dir: str,
+        images: Optional[torch.Tensor] = None,
+        output_format: str = "PNG",
+        filename_prefix: str = "ComfyUI_",
+        add_sequence_number: bool = True,
+        output_dir: str = folder_paths.get_output_directory(),
         prompt: Optional[Dict] = None,
         extra_pnginfo: Optional[Dict] = None,
         mask: Optional[torch.Tensor] = None,
@@ -233,6 +222,12 @@ class HTSaveImagePlus:
         """Process and save images with optional mask and text output."""
         print(f"\nHTSaveImagePlus v{VERSION} - Processing")
         print(f"Target directory: {output_dir}")
+        
+        # Check if images are None or empty
+        if images is None or (isinstance(images, torch.Tensor) and images.numel() == 0) or len(images) == 0:
+            print("No images to save, skipping operation")
+            return {"ui": {"info": "No images to save"}}
+            
         print(f"Format: {output_format}, Sequence numbering: {'Enabled' if add_sequence_number else 'Disabled'}")
         
         # Ensure output directory exists

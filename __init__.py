@@ -42,8 +42,9 @@ from .nodes.ht_resolution_downsample_node import HTResolutionDownsampleNode
 from .nodes.ht_photoshop_blur_node import HTPhotoshopBlurNode
 from .nodes.ht_levels_node import HTLevelsNode
 from .nodes.ht_resize_node import HTResizeNode
-from .nodes.ht_oidn_node import HTOIDNNode
+# from .nodes.ht_oidn_node import HTOIDNNode
 from .nodes.ht_save_image_plus import HTSaveImagePlus
+from .nodes.ht_detection_batch_processor import HTDetectionBatchProcessor
 
 # Dimension Handling Nodes
 from .nodes.ht_resolution_node import HTResolutionNode
@@ -54,7 +55,7 @@ from .nodes.ht_mask_dilation_node import HTMaskDilationNode
 from .nodes.ht_tensor_info_node import HTTensorInfoNode
 
 # Layer Management Nodes
-from .nodes.ht_layer_nodes import HTLayerCollectorNode, HTLayerExportNode
+# from .nodes.ht_layer_nodes import HTLayerCollectorNode, HTLayerExportNode
 from .nodes.ht_mask_validator_node import HTMaskValidatorNode
 
 # AI Pipeline Nodes
@@ -95,8 +96,9 @@ NODE_CLASS_MAPPINGS = {
     "HTPhotoshopBlurNode": HTPhotoshopBlurNode,
     "HTLevelsNode": HTLevelsNode,
     "HTResizeNode": HTResizeNode,
-    "HTOIDNNode": HTOIDNNode,
+#    "HTOIDNNode": HTOIDNNode,
     "HTSaveImagePlus": HTSaveImagePlus,
+    "HTDetectionBatchProcessor": HTDetectionBatchProcessor,
     
     # Dimension Handling
     "HTResolutionNode": HTResolutionNode,
@@ -107,8 +109,8 @@ NODE_CLASS_MAPPINGS = {
     "HTTensorInfoNode": HTTensorInfoNode,
     
     # Layer Management
-    "HTLayerCollectorNode": HTLayerCollectorNode,
-    "HTLayerExportNode": HTLayerExportNode,
+    # "HTLayerCollectorNode": HTLayerCollectorNode,
+    # "HTLayerExportNode": HTLayerExportNode,
     "HTMaskValidatorNode": HTMaskValidatorNode,
     
     # AI Pipeline
@@ -147,8 +149,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HTPhotoshopBlurNode": "HT Photoshop Blur",
     "HTLevelsNode": "HT Levels",
     "HTResizeNode": "HT Smart Resize",
-    "HTOIDNNode": "HT Intel Denoiser",
+#    "HTOIDNNode": "HT Intel Denoiser",
     "HTSaveImagePlus": "HT Save Image Plus",
+    "HTDetectionBatchProcessor": "HT Detection Batch Processor",
     
     # Dimension Handling
     "HTResolutionNode": "HT Resolution",
@@ -159,8 +162,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HTTensorInfoNode": "HT Tensor Info",
     
     # Layer Management
-    "HTLayerCollectorNode": "HT Layer Collector",
-    "HTLayerExportNode": "HT Layer Export",
+    # "HTLayerCollectorNode": "HT Layer Collector",
+    # "HTLayerExportNode": "HT Layer Export",
     "HTMaskValidatorNode": "HT Mask Validator",
     
     # AI Pipeline
