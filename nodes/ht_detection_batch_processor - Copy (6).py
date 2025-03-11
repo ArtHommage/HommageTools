@@ -1,9 +1,8 @@
 """
 File: homage_tools/nodes/ht_detection_batch_processor.py
-Version: 1.4.1
+Version: 1.4.0
 Description: Node for detecting regions, applying mask dilation, and processing with model-based upscaling/downscaling
              Using ComfyUI's built-in VAE nodes for better tensor handling
-             Optimized for memory efficiency with large images
 """
 
 #------------------------------------------------------------------------------
@@ -35,30 +34,14 @@ logger = logging.getLogger('HommageTools')
 #------------------------------------------------------------------------------
 # Section 2: Constants and Configuration
 #------------------------------------------------------------------------------
-VERSION = "1.4.1"
+VERSION = "1.4.0"
 MAX_RESOLUTION = 8192
 # Standard bucket sizes for auto-scaling
 STANDARD_BUCKETS = [512, 768, 1024]
-# Memory optimization constants
-MAX_REGION_PIXELS = 1024 * 1024  # Max pixels in a region before scaling
-MAX_PROCESSING_DIM = 1024  # Maximum dimension for processing
-MEMORY_MONITORING = True  # Enable memory usage monitoring
 
 #------------------------------------------------------------------------------
 # Section 3: Helper Functions
 #------------------------------------------------------------------------------
-def create_placeholder():
-    """Create minimal placeholder tensors for when no detections are found"""
-    placeholder_image = torch.zeros((1, 10, 10, 3), dtype=torch.float32)
-    placeholder_mask = torch.ones((1, 10, 10, 1), dtype=torch.float32)
-    return placeholder_image, placeholder_mask
-def log_memory():
-    """Log GPU memory usage if available and enabled"""
-    if MEMORY_MONITORING and torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**2
-        max_allocated = torch.cuda.max_memory_allocated() / 1024**2
-        logger.info(f"GPU Memory: Current={allocated:.1f}MB, Peak={max_allocated:.1f}MB")
-
 def get_nearest_divisible_size(size: int, divisor: int) -> int:
     """Calculate nearest size divisible by divisor."""
     return ((size + divisor - 1) // divisor) * divisor
@@ -120,17 +103,6 @@ def tensor_gaussian_blur_mask(mask_tensor, blur_size):
         blurred = cv2.GaussianBlur(img, (blur_amount, blur_amount), 0)
         return torch.from_numpy(blurred).unsqueeze(-1)
 
-def dynamic_steps_for_size(input_h, input_w, base_steps):
-    """Dynamically adjust steps based on image size to save memory"""
-    pixels = input_h * input_w
-    
-    if pixels > 2 * MAX_REGION_PIXELS:
-        return min(base_steps, 5)  # Very large regions
-    elif pixels > MAX_REGION_PIXELS:
-        return min(base_steps, 10)  # Large regions
-    else:
-        return base_steps  # Normal size regions
-
 #------------------------------------------------------------------------------
 # Section 4: Tensor Format Functions
 #------------------------------------------------------------------------------
@@ -191,100 +163,85 @@ def ensure_bhwc_format(tensor, name="Unknown"):
 def process_with_model(
     image: torch.Tensor,
     upscale_model: Any,
-    target_width: int,
-    target_height: int,
+    target_size: int,
+    scale_factor: float = 1.0,
     divisibility: int = 64,
     tile_size: int = 512,
     overlap: int = 64
 ) -> torch.Tensor:
-    """Process image with model-based scaling to exact target dimensions"""
+    """Process image with model-based scaling to target size multiplied by scale factor"""
     import torchvision.transforms.functional as TF
     from PIL import Image
     
+    # Ensure image is in BHWC format
+    image = ensure_bhwc_format(image, "process_with_model input")
+
+    # Calculate current dimensions and target dimensions
+    input_h, input_w = image.shape[1:3]
+    long_edge = max(input_w, input_h)
+
+    # Calculate basic scale to reach target bucket size
+    base_scale = target_size / long_edge
+
+    # Apply additional scale factor
+    final_scale = base_scale * scale_factor
+
+    print(f"Scaling from {input_w}x{input_h} (BHWC) to bucket size {target_size} with factor {scale_factor}")
+    print(f"Final scale factor: {final_scale:.4f}")
+
+    # Calculate output dimensions while maintaining aspect ratio
+    if input_w >= input_h:
+        output_w = int(input_w * final_scale)
+        output_h = int(input_h * final_scale)
+    else:
+        output_h = int(input_h * final_scale)
+        output_w = int(input_w * final_scale)
+
     # Ensure dimensions are divisible by divisibility factor
-    output_w = get_nearest_divisible_size(target_width, divisibility)
-    output_h = get_nearest_divisible_size(target_height, divisibility)
+    output_w = get_nearest_divisible_size(output_w, divisibility)
+    output_h = get_nearest_divisible_size(output_h, divisibility)
+
+    print(f"Final dimensions: {output_w}x{output_h} (divisible by {divisibility})")
+
+    # Convert tensor to PIL images for resizing
+    batch_size = image.shape[0]
+    pil_images = []
     
-    # Get current dimensions - assume image is in BHWC format
-    batch_size, input_h, input_w, channels = image.shape
-    print(f"Scaling from {input_w}x{input_h} to {output_w}x{output_h}")
-    
-    # Try to use model-based upscaling if available
-    if upscale_model is not None:
-        try:
-            # Get model scale factor
-            model_scale = getattr(upscale_model, 'scale', 4)
-            
-            # Calculate intermediate size if needed
-            if abs(output_w/input_w - model_scale) > 0.5 or abs(output_h/input_h - model_scale) > 0.5:
-                # We need to resize to an intermediate size first
-                intermediate_w = int(output_w / model_scale)
-                intermediate_h = int(output_h / model_scale)
-                print(f"Intermediate resize to {intermediate_w}x{intermediate_h}")
-                
-                # Convert BHWC to PIL for reliable resizing
-                resized_list = []
-                for b in range(batch_size):
-                    img = image[b].cpu().detach().numpy()
-                    img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-                    pil_img = Image.fromarray(img)
-                    resized = pil_img.resize((intermediate_w, intermediate_h), Image.Resampling.LANCZOS)
-                    resized_list.append(np.array(resized).astype(np.float32) / 255.0)
-                
-                # Convert back to tensor in BHWC format
-                image = torch.stack([torch.from_numpy(img) for img in resized_list], dim=0)
-            
-            # Convert to BCHW for model
-            image_for_model = image.permute(0, 3, 1, 2).contiguous()
-            print(f"Tensor for model: {image_for_model.shape}")
-            
-            # Create upscaler instance
-            upscaler = model_upscale.ImageUpscaleWithModel()
-            
-            # Apply upscaling
-            with torch.no_grad():
-                result = upscaler.upscale(upscale_model, image_for_model)
-                print(f"Upscaled result: {result.shape}")
-                
-                # Convert back to BHWC
-                output = result.permute(0, 2, 3, 1).contiguous()
-                
-                # Final resize if needed
-                if output.shape[1] != output_h or output.shape[2] != output_w:
-                    # Use PIL for final resize
-                    final_images = []
-                    for b in range(output.shape[0]):
-                        img = output[b].cpu().detach().numpy()
-                        img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-                        pil_img = Image.fromarray(img)
-                        resized = pil_img.resize((output_w, output_h), Image.Resampling.LANCZOS)
-                        final_images.append(np.array(resized).astype(np.float32) / 255.0)
-                    
-                    output = torch.stack([torch.from_numpy(img) for img in final_images], dim=0)
-                
-                return output
-                
-        except Exception as e:
-            print(f"Error in model-based upscaling: {e}")
-            traceback.print_exc()
-            print("Falling back to PIL-based scaling")
-    
-    # Fallback to PIL scaling
-    final_images = []
     for b in range(batch_size):
-        img = image[b].cpu().detach().numpy()
-        img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-        pil_img = Image.fromarray(img)
-        resized = pil_img.resize((output_w, output_h), Image.Resampling.LANCZOS)
-        final_images.append(np.array(resized).astype(np.float32) / 255.0)
+        # Extract single image and convert to numpy
+        img_np = image[b].detach().cpu().numpy()
+        # Ensure the values are in 0-1 range
+        if img_np.max() <= 1.0:
+            img_np = (img_np * 255).astype('uint8')
+        else:
+            img_np = img_np.astype('uint8')
+        # Convert to PIL
+        pil_img = Image.fromarray(img_np)
+        pil_images.append(pil_img)
     
-    return torch.stack([torch.from_numpy(img) for img in final_images], dim=0)
+    # Resize images using Lanczos resampling
+    resized_pil = []
+    for pil_img in pil_images:
+        resized = pil_img.resize((output_w, output_h), Image.Resampling.LANCZOS)
+        resized_pil.append(resized)
+    
+    # Convert back to tensors
+    result_tensors = []
+    for pil_img in resized_pil:
+        # Convert PIL to Tensor
+        tensor = TF.to_tensor(pil_img).unsqueeze(0)  # Add batch dimension
+        # Convert to BHWC
+        tensor = tensor.permute(0, 2, 3, 1)
+        result_tensors.append(tensor)
+    
+    # Combine tensors into a batch
+    if len(result_tensors) > 1:
+        return torch.cat(result_tensors, dim=0)
+    else:
+        return result_tensors[0]
 
 def match_mask_to_proportions(mask: torch.Tensor, target_w: int, target_h: int, divisibility: int) -> torch.Tensor:
     """Dilate and adjust mask to match target proportions while ensuring divisibility"""
-    from PIL import Image
-    import numpy as np
-    
     # Ensure we have BHWC format
     mask = ensure_bhwc_format(mask, "mask_input")
     
@@ -298,40 +255,24 @@ def match_mask_to_proportions(mask: torch.Tensor, target_w: int, target_h: int, 
         # Return original mask
         return mask
     
-    # Convert tensor mask to PIL
-    batch_size = mask.shape[0]
-    pil_masks = []
+    # Convert to BCHW for F.interpolate
+    mask_bchw = mask.permute(0, 3, 1, 2)
     
-    for b in range(batch_size):
-        # Extract single mask and convert to numpy
-        mask_np = mask[b, ..., 0].detach().cpu().numpy()
-        # Scale to 0-255 for PIL
-        mask_np = (mask_np * 255).astype('uint8')
-        # Convert to PIL
-        pil_mask = Image.fromarray(mask_np)
-        pil_masks.append(pil_mask)
+    # Resize mask
+    resized_mask = F.interpolate(
+        mask_bchw,
+        size=(target_h, target_w),
+        mode='bilinear',
+        align_corners=False
+    )
     
-    # Resize masks
-    resized_pil = []
-    for pil_mask in pil_masks:
-        # Use nearest neighbor for mask resizing to preserve binary values
-        resized = pil_mask.resize((target_w, target_h), Image.Resampling.NEAREST)
-        resized_pil.append(resized)
+    # Convert back to BHWC
+    resized_mask = resized_mask.permute(0, 2, 3, 1)
     
-    # Convert back to tensors
-    result_tensors = []
-    for pil_mask in resized_pil:
-        # Convert PIL to numpy
-        mask_np = np.array(pil_mask).astype(np.float32) / 255.0
-        # Convert numpy to tensor and add channel dimension
-        tensor = torch.from_numpy(mask_np).unsqueeze(-1)  # Add channel dimension
-        result_tensors.append(tensor)
+    # Maintain mask integrity after resizing
+    resized_mask = (resized_mask > 0.5).float()
     
-    # Combine tensors into a batch
-    if len(result_tensors) > 1:
-        return torch.stack(result_tensors, dim=0)
-    else:
-        return result_tensors[0].unsqueeze(0)  # Add batch dimension
+    return resized_mask
 
 #------------------------------------------------------------------------------
 # Section 5: Main Node Implementation
@@ -341,7 +282,6 @@ class HTDetectionBatchProcessor:
     Node for detecting regions, processing with mask dilation, and scaling detected regions.
     Combines BBOX detection, masking, and model-based upscaling in one workflow.
     Uses standard bucket sizes (512, 768, 1024) with additional scale factor.
-    Memory-optimized for large images and regions.
     """
     
     CATEGORY = "HommageTools/Processor"
@@ -386,65 +326,43 @@ class HTDetectionBatchProcessor:
         }
     
     def apply_ksampler(self, sampler_name, scheduler, latent, seed, steps, cfg, denoise, model=None, positive=None, negative=None):
-        """Apply KSampler to latent representation with memory optimization"""
+        """Apply KSampler to latent representation"""
         print(f"Applying KSampler with steps={steps}, cfg={cfg}, denoise={denoise}")
         
         try:
             from nodes import common_ksampler
             
-            # Log initial memory usage
-            if MEMORY_MONITORING:
-                log_memory()
+            # Handle different return value formats from common_ksampler
+            result = common_ksampler(
+                model=model,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                positive=positive,
+                negative=negative,
+                latent=latent,
+                denoise=denoise
+            )
             
-            # Use no_grad context to save memory
-            with torch.no_grad():
-                # Handle different return value formats from common_ksampler
-                results = common_ksampler(
-                    model=model,
-                    seed=seed,
-                    steps=steps,
-                    cfg=cfg,
-                    sampler_name=sampler_name,
-                    scheduler=scheduler,
-                    positive=positive,
-                    negative=negative,
-                    latent=latent,
-                    denoise=denoise
-                )
-                
-                # Check if result is a tuple or a single value
-                if isinstance(results, tuple) and len(results) > 0:
-                    # Extract the first item if it's a tuple
-                    result = results[0]
-                else:
-                    # Use result directly if it's not a tuple
-                    result = results
-            
-            # Clear cache after processing
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-            # Log memory after processing
-            if MEMORY_MONITORING:
-                log_memory()
-                
-            return result
+            # Check if result is a tuple or a single value
+            if isinstance(result, tuple):
+                # Extract the first item if it's a tuple
+                return result[0]
+            else:
+                # Use result directly if it's not a tuple
+                return result
                 
         except Exception as e:
             print(f"Error in KSampler: {e}")
             traceback.print_exc()
-            
-            # Try to clear memory on error
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
             return latent
     
     def process(self, image: torch.Tensor, detection_threshold: float, mask_dilation: int, crop_factor:float, drop_size: int, tile_size: int, scale_mode: str, scale_factor: float, divisibility: str, mask_blur: int, overlap: int, model, vae, steps: int, cfg: float, denoise: float, sampler_name: str, scheduler: str, seed: int, bbox_detector=None, upscale_model=None, positive=None, negative=None, labels="all") -> Tuple[List[torch.Tensor], List[torch.Tensor], Any, List[torch.Tensor], Optional[torch.Tensor], int]:
         """
         Process the input image through detection, masking, and scaling pipeline.
         Uses standard bucket sizes with additional scale factor.
-        Memory-optimized for large images and regions.
         """
         logger.info(f"\n===== HTDetectionBatchProcessor v{VERSION} - Starting =====")
         
@@ -455,10 +373,6 @@ class HTDetectionBatchProcessor:
         
         # Convert divisibility from string to int
         div_factor = int(divisibility)
-        
-        # Initial memory usage
-        if MEMORY_MONITORING:
-            log_memory()
         
         # Ensure BHWC format
         try:
@@ -495,24 +409,16 @@ class HTDetectionBatchProcessor:
                 # Run detection
                 segs = bbox_detector.detect(detect_image, detection_threshold, mask_dilation, crop_factor, drop_size)
                 
-                # Clear cache after detection
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
                 # Validate detection result format
                 if not isinstance(segs, tuple) or len(segs) < 2:
                     logger.warning(f"Unexpected detection result format: {type(segs)}")
-                        # Return tiny placeholder image for invalid detection format
-                    placeholder_image, placeholder_mask = create_placeholder()
-                    return [placeholder_image], [placeholder_mask], ((10, 10), []), [placeholder_image], image, 0
+                    return processed_images, processed_masks, ((height, width), []), cropped_images, bypass_image, bbox_count
                     
                 logger.info(f"Detection found {len(segs[1])} segments")
             except Exception as e:
                 logger.error(f"Detection error: {e}")
                 traceback.print_exc()
-                # Return tiny placeholder image when detector errors occur
-                placeholder_image, placeholder_mask = create_placeholder()
-                return [placeholder_image], [placeholder_mask], ((10, 10), []), [placeholder_image], image, 0
+                return processed_images, processed_masks, ((height, width), []), cropped_images, bypass_image, bbox_count
                 
             # Filter by labels
             if labels != '' and labels != 'all':
@@ -528,16 +434,12 @@ class HTDetectionBatchProcessor:
                 segs = (segs[0], filtered_segs)
         else:
             logger.warning("No detector provided!")
-            # Return tiny placeholder image when no detector is provided
-            placeholder_image, placeholder_mask = create_placeholder()
-            return [placeholder_image], [placeholder_mask], ((10, 10), []), [placeholder_image], image, 0
+            return processed_images, processed_masks, ((height, width), []), cropped_images, bypass_image, bbox_count
         
         # Step 2: Process each detection
         if not segs[1] or len(segs[1]) == 0:
             logger.info("No detections found")
-            # Return tiny placeholder image when no detections found
-            placeholder_image, placeholder_mask = create_placeholder()
-            return [placeholder_image], [placeholder_mask], segs, [placeholder_image], image, 0
+            return processed_images, processed_masks, ((height, width), []), cropped_images, bypass_image, bbox_count
         
         logger.info(f"Processing {len(segs[1])} detected regions...")
         bbox_count = len(segs[1])  # Store the number of detected bboxes
@@ -554,13 +456,6 @@ class HTDetectionBatchProcessor:
         else:
             logger.info("Skipping KSampler (either missing conditioning or denoise=0)")
         
-        # Try to enable CPU offloading for VAE if possible 
-        try:
-            vae.cpu_offload = True
-            logger.info("Enabled VAE CPU offloading")
-        except:
-            logger.info("VAE CPU offloading not available")
-        
         for i, seg in enumerate(segs[1]):
             try:
                 logger.info(f"Region {i+1}/{len(segs[1])}: {seg.label}")
@@ -570,13 +465,6 @@ class HTDetectionBatchProcessor:
                 crop_width = x2 - x1
                 crop_height = y2 - y1
                 logger.info(f"Crop region: ({x1},{y1}) to ({x2},{y2}) → {crop_width}x{crop_height}")
-                
-                # Check if region is too large and needs scaling
-                region_pixels = crop_width * crop_height
-                region_scale_factor = 1.0
-                if region_pixels > MAX_REGION_PIXELS:
-                    region_scale_factor = math.sqrt(MAX_REGION_PIXELS / region_pixels)
-                    logger.info(f"Large region detected ({region_pixels} pixels), scaling by factor {region_scale_factor:.3f} for processing")
                 
                 # Extract cropped image
                 if hasattr(seg, 'cropped_image') and seg.cropped_image is not None:
@@ -609,40 +497,6 @@ class HTDetectionBatchProcessor:
                 # Store cropped image in the list
                 cropped_images.append(cropped_image)
                 
-                # Apply scaling if region is too large
-                if region_scale_factor < 1.0:
-                    import torchvision.transforms.functional as TF
-                    temp_width = int(crop_width * region_scale_factor)
-                    temp_height = int(crop_height * region_scale_factor)
-                    
-                    # Resize using PIL for memory efficiency
-                    batch_size = cropped_image.shape[0]
-                    temp_images = []
-                    
-                    for b in range(batch_size):
-                        # Extract single image and convert to numpy
-                        img_np = cropped_image[b].detach().cpu().numpy()
-                        # Ensure values are in 0-1 range
-                        if img_np.max() <= 1.0:
-                            img_np = (img_np * 255).astype('uint8')
-                        else:
-                            img_np = img_np.astype('uint8')
-                        # Convert to PIL and resize
-                        pil_img = Image.fromarray(img_np)
-                        resized = pil_img.resize((temp_width, temp_height), Image.Resampling.LANCZOS)
-                        # Convert back to tensor
-                        tensor = TF.to_tensor(resized).unsqueeze(0)  # Add batch
-                        tensor = tensor.permute(0, 2, 3, 1)  # BCHW to BHWC
-                        temp_images.append(tensor)
-                    
-                    # Combine tensors
-                    if len(temp_images) > 1:
-                        cropped_image = torch.cat(temp_images, dim=0)
-                    else:
-                        cropped_image = temp_images[0]
-                    
-                    logger.info(f"Scaled to {temp_width}x{temp_height} for processing")
-                
                 # Get mask
                 if hasattr(seg, 'cropped_mask') and seg.cropped_mask is not None:
                     try:
@@ -668,22 +522,6 @@ class HTDetectionBatchProcessor:
                         cropped_mask = torch.ones((crop_height, crop_width, 1), dtype=torch.float32)
                 else:
                     cropped_mask = torch.ones((crop_height, crop_width, 1), dtype=torch.float32)
-                
-                # Apply region scaling to mask if needed
-                if region_scale_factor < 1.0:
-                    # Scale mask using same method as above
-                    temp_width = int(crop_width * region_scale_factor)
-                    temp_height = int(crop_height * region_scale_factor)
-                    
-                    # Convert to PIL and resize
-                    mask_np = cropped_mask[..., 0].cpu().numpy()
-                    mask_np = (mask_np * 255).astype('uint8')
-                    mask_pil = Image.fromarray(mask_np)
-                    mask_resized = mask_pil.resize((temp_width, temp_height), Image.Resampling.NEAREST)
-                    
-                    # Convert back to tensor
-                    mask_np_resized = np.array(mask_resized).astype(np.float32) / 255.0
-                    cropped_mask = torch.from_numpy(mask_np_resized).unsqueeze(-1)
                 
                 # Process mask if needed
                 if mask_dilation != 0:
@@ -732,44 +570,34 @@ class HTDetectionBatchProcessor:
                 # Process image with KSampler if available
                 if use_ksampler:
                     try:
-                        # Dynamically adjust steps based on region size
-                        effective_steps = dynamic_steps_for_size(
-                            cropped_image.shape[1], 
-                            cropped_image.shape[2], 
-                            steps
-                        )
-                        
-                        if effective_steps < steps:
-                            logger.info(f"Reduced steps from {steps} to {effective_steps} for memory efficiency")
-                        
                         # ===== VAE ENCODING using ComfyUI's VAEEncode node =====
                         logger.info("Using ComfyUI's VAEEncode node")
                         # Note: VAEEncode expects BCHW, but should handle conversion internally
-                        with torch.amp.autocast('cuda'):  # Use mixed precision to save memory
-                            latent = vae_encoder.encode(vae, cropped_image)[0]
-                            logger.info(f"VAE encoding successful: {latent['samples'].shape}")
+                        latent = vae_encoder.encode(vae, cropped_image)[0]
+                        logger.info(f"VAE encoding successful: {latent['samples'].shape}")
                         
-                            # Apply KSampler
-                            sampled_latent = self.apply_ksampler(
-                                sampler_name=sampler_name,
-                                scheduler=scheduler,
-                                latent=latent,
-                                seed=seed,
-                                steps=effective_steps,
-                                cfg=cfg,
-                                denoise=denoise,
-                                model=model,
-                                positive=positive,
-                                negative=negative
-                            )
+                        # Apply KSampler
+                        logger.info(f"Applying KSampler with steps={steps}, cfg={cfg}, denoise={denoise}")
+                        sampled_latent = self.apply_ksampler(
+                            sampler_name=sampler_name,
+                            scheduler=scheduler,
+                            latent=latent,
+                            seed=seed,
+                            steps=steps,
+                            cfg=cfg,
+                            denoise=denoise,
+                            model=model,
+                            positive=positive,
+                            negative=negative
+                        )
                         
-                            # Decode using ComfyUI's VAEDecode node
-                            logger.info("Decoding with VAEDecode")
-                            if tile_size >= 512:  # Use tiled decode for large images
-                                logger.info(f"Using tiled decode with tile size {tile_size}")
-                                decoded = vae_decoder_tiled.decode(vae, sampled_latent, tile_size)[0]
-                            else:
-                                decoded = vae_decoder.decode(vae, sampled_latent)[0]
+                        # Decode using ComfyUI's VAEDecode node
+                        logger.info("Decoding with VAEDecode")
+                        if tile_size >= 512:  # Use tiled decode for large images
+                            logger.info(f"Using tiled decode with tile size {tile_size}")
+                            decoded = vae_decoder_tiled.decode(vae, sampled_latent, tile_size)[0]
+                        else:
+                            decoded = vae_decoder.decode(vae, sampled_latent)[0]
                         
                         logger.info(f"Decoded shape: {decoded.shape}")
                         
@@ -780,9 +608,6 @@ class HTDetectionBatchProcessor:
                     except Exception as e:
                         logger.error(f"Error in VAE processing: {e}")
                         traceback.print_exc()
-                        # Clear GPU memory
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
                         # Fall back to direct scaling
                         use_direct_scaling = True
                 else:
@@ -800,43 +625,16 @@ class HTDetectionBatchProcessor:
                 # Scale to target size
                 logger.info(f"Scaling to {target_w}x{target_h}")
                 
-                # Apply scaling with memory efficiency
-                try:
-                    scaled_image = process_with_model(
-                        source_image, 
-                        upscale_model, 
-                        target_w,
-                        target_h,
-                        divisibility=div_factor,
-                        tile_size=min(tile_size, 256),  # Limit tile size for memory efficiency
-                        overlap=overlap
-                    )
-                except Exception as e:
-                    logger.error(f"Error in image scaling: {e}")
-                    # Fall back to PIL-based scaling in case of error
-                    import torchvision.transforms.functional as TF
-                    from PIL import Image
-                    
-                    # Convert to PIL and scale
-                    batch_size = source_image.shape[0]
-                    scaled_batch = []
-                    
-                    for b in range(batch_size):
-                        img_np = source_image[b].detach().cpu().numpy()
-                        if img_np.max() <= 1.0:
-                            img_np = (img_np * 255).astype('uint8')
-                        else:
-                            img_np = img_np.astype('uint8')
-                        pil_img = Image.fromarray(img_np)
-                        scaled_pil = pil_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                        tensor = TF.to_tensor(scaled_pil).unsqueeze(0)
-                        tensor = tensor.permute(0, 2, 3, 1)
-                        scaled_batch.append(tensor)
-                    
-                    if len(scaled_batch) > 1:
-                        scaled_image = torch.cat(scaled_batch, dim=0)
-                    else:
-                        scaled_image = scaled_batch[0]
+                # Apply bicubic scaling (model-based upscaling to be reimplemented later)
+                scaled_image = process_with_model(
+                    source_image, 
+                    upscale_model, 
+                    target_size,
+                    scale_factor=1.0,  # Already applied in target calculation
+                    divisibility=div_factor,
+                    tile_size=tile_size,
+                    overlap=overlap
+                )
                 
                 # Scale and match mask to target dimensions
                 scaled_mask = match_mask_to_proportions(
@@ -849,20 +647,14 @@ class HTDetectionBatchProcessor:
                 # Verify final dimensions match for mask and image
                 if scaled_mask.shape[1:3] != scaled_image.shape[1:3]:
                     logger.warning(f"Dimensions mismatch. Image: {scaled_image.shape}, Mask: {scaled_mask.shape}")
-                    # Try to fix mask dimensions to match image
-                    try:
-                        mask_bchw = scaled_mask.permute(0, 3, 1, 2)
-                        fixed_mask = F.interpolate(
-                            mask_bchw,
-                            size=(scaled_image.shape[1], scaled_image.shape[2]),
-                            mode='nearest'
-                        )
-                        scaled_mask = fixed_mask.permute(0, 2, 3, 1)
-                    except Exception as e:
-                        logger.error(f"Error fixing mask dimensions: {e}")
-                        # Create new mask with correct dimensions
-                        scaled_mask = torch.ones((scaled_image.shape[0], scaled_image.shape[1], scaled_image.shape[2], 1), 
-                                               dtype=torch.float32, device=scaled_image.device)
+                    # Fix mask dimensions to match image
+                    mask_bchw = scaled_mask.permute(0, 3, 1, 2)
+                    fixed_mask = F.interpolate(
+                        mask_bchw,
+                        size=(scaled_image.shape[1], scaled_image.shape[2]),
+                        mode='nearest'
+                    )
+                    scaled_mask = fixed_mask.permute(0, 2, 3, 1)
                 
                 # Move back to CPU for output
                 scaled_image = scaled_image.cpu()
@@ -879,9 +671,6 @@ class HTDetectionBatchProcessor:
             except Exception as e:
                 logger.error(f"Error processing region {i+1}: {e}")
                 traceback.print_exc()
-                # Free memory on error
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 # Continue with the next region
                 continue
         
@@ -889,10 +678,9 @@ class HTDetectionBatchProcessor:
         
         # Make sure we're not returning empty lists
         if not processed_images:
-            # Return tiny placeholder image when processing failed for all regions
-            logger.warning("No processed images found, using placeholder image")
-            placeholder_image, placeholder_mask = create_placeholder()
-            processed_images.append(placeholder_image)
-            processed_masks.append(placeholder_mask)
+            # Return input image as fallback
+            logger.warning("No processed images found, using input image as fallback")
+            processed_images.append(image)
+            processed_masks.append(torch.ones((batch, height, width, 1), dtype=torch.float32))
             
         return processed_images, processed_masks, segs, cropped_images, bypass_image, bbox_count

@@ -2,8 +2,18 @@
 File: homage_tools/nodes/ht_save_image_plus.py
 Version: 1.2.0
 Description: Enhanced image saving node with multiple format support, mask handling, and text output capabilities
+
+Sections:
+1. Imports and Constants
+2. Helper Functions
+3. Main Node Class
+4. Format Conversion Functions
+5. File Management
 """
 
+#------------------------------------------------------------------------------
+# Section 1: Imports and Constants
+#------------------------------------------------------------------------------
 import os
 import json
 from PIL import Image, PngImagePlugin
@@ -15,10 +25,10 @@ from typing import Dict, Any, Tuple, Optional, Union
 
 logger = logging.getLogger('HommageTools')
 
-VERSION = "1.2.0"  # Updated version number
+VERSION = "1.2.0"
 
 #------------------------------------------------------------------------------
-# Section 1: Helper Functions
+# Section 2: Helper Functions
 #------------------------------------------------------------------------------
 def ensure_directory_exists(directory: str) -> bool:
     """Create directory if it doesn't exist."""
@@ -48,8 +58,17 @@ def write_text_file(file_path: str, content: str, encoding: str = 'UTF-8') -> bo
         logger.error(f"Failed to write text file {file_path}: {str(e)}")
         return False
 
+def get_total_pixels(image: torch.Tensor) -> int:
+    """Calculate total number of pixels in an image."""
+    if len(image.shape) == 4:  # BHWC format
+        return image.shape[1] * image.shape[2]  # Height * Width
+    elif len(image.shape) == 3:  # HWC format
+        return image.shape[0] * image.shape[1]  # Height * Width
+    else:
+        return 0
+
 #------------------------------------------------------------------------------
-# Section 2: Main Node Class
+# Section 3: Main Node Class
 #------------------------------------------------------------------------------
 class HTSaveImagePlus:
     """Enhanced image saving node with multiple format and mask support."""
@@ -80,6 +99,13 @@ class HTSaveImagePlus:
                 "output_dir": ("STRING", {
                     "default": folder_paths.get_output_directory(),
                     "tooltip": "Output directory path"
+                }),
+                "min_pixel_threshold": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1000000,
+                    "step": 1000,
+                    "tooltip": "Skip saving images with fewer pixels than this threshold"
                 })
             },
             "optional": {
@@ -106,7 +132,8 @@ class HTSaveImagePlus:
                 # Text Output Options  
                 "text_content": ("STRING", {
                     "multiline": True,
-                    "tooltip": "Optional text content to save alongside image"
+                    "tooltip": "Optional text content to save alongside image",
+                    "ui_height": 4    # Limit the height of the text input
                 }),
                 "text_extension": ("STRING", {
                     "default": ".txt",
@@ -129,7 +156,7 @@ class HTSaveImagePlus:
         }
 
     #--------------------------------------------------------------------------
-    # Section 3: Format Conversion Functions
+    # Section 4: Format Conversion Functions
     #--------------------------------------------------------------------------
     def _prepare_image(self, image: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Image.Image:
         """Convert BHWC tensor to PIL Image, handling alpha channel."""
@@ -173,6 +200,7 @@ class HTSaveImagePlus:
                 image = image.convert('RGB')
                 
             if format == "PNG":
+                # Create new PngInfo for metadata if needed
                 # Create metadata for PNG if needed
                 png_info = None
                 if metadata and kwargs.get('save_metadata', True):
@@ -199,21 +227,23 @@ class HTSaveImagePlus:
             return False
 
     #--------------------------------------------------------------------------
-    # Section 4: Main Processing
+    # Section 5: Main Processing
     #--------------------------------------------------------------------------
     def save_image_plus(
         self,
-        images: Optional[torch.Tensor] = None,
-        output_format: str = "PNG",
-        filename_prefix: str = "ComfyUI_",
-        add_sequence_number: bool = True,
-        output_dir: str = folder_paths.get_output_directory(),
+        images: torch.Tensor,
+        output_format: str,
+        filename_prefix: str,
+        add_sequence_number: bool,
+        output_dir: str,
+        min_pixel_threshold: int,
         prompt: Optional[Dict] = None,
         extra_pnginfo: Optional[Dict] = None,
-        mask: Optional[torch.Tensor] = None,
-        save_alpha: bool = True,
+        # Optional parameters in the exact order defined in INPUT_TYPES
         jpeg_quality: int = 90,
         tiff_compression: str = "adobe_deflate",
+        mask: Optional[torch.Tensor] = None,
+        save_alpha: bool = True,
         text_content: Optional[str] = None,
         text_extension: str = ".txt",
         text_encoding: str = "UTF-8",
@@ -222,19 +252,15 @@ class HTSaveImagePlus:
         """Process and save images with optional mask and text output."""
         print(f"\nHTSaveImagePlus v{VERSION} - Processing")
         print(f"Target directory: {output_dir}")
-        
-        # Check if images are None or empty
-        if images is None or (isinstance(images, torch.Tensor) and images.numel() == 0) or len(images) == 0:
-            print("No images to save, skipping operation")
-            return {"ui": {"info": "No images to save"}}
-            
         print(f"Format: {output_format}, Sequence numbering: {'Enabled' if add_sequence_number else 'Disabled'}")
+        print(f"Minimum pixel threshold: {min_pixel_threshold}")
         
         # Ensure output directory exists
         if not ensure_directory_exists(output_dir):
             return {"ui": {"error": f"Failed to create output directory: {output_dir}"}}
 
         results = []
+        skipped_count = 0
         
         # Prepare metadata for PNG
         metadata = None
@@ -247,6 +273,13 @@ class HTSaveImagePlus:
 
         # Process each image in batch
         for idx, image in enumerate(images):
+            # Check pixel threshold
+            total_pixels = get_total_pixels(image)
+            if total_pixels < min_pixel_threshold:
+                print(f"Skipping image {idx}: {total_pixels} pixels (below threshold of {min_pixel_threshold})")
+                skipped_count += 1
+                continue
+                
             # Create base filename
             base_name = os.path.join(output_dir, filename_prefix)
             extension = f".{output_format.lower()}"
@@ -278,7 +311,7 @@ class HTSaveImagePlus:
                 save_metadata=save_metadata
             ):
                 # Log successful image save to console
-                print(f"Successfully saved image: {file_path}")
+                print(f"Successfully saved image: {file_path} ({total_pixels} pixels)")
                 
                 results.append({
                     "filename": os.path.basename(file_path),
@@ -294,4 +327,7 @@ class HTSaveImagePlus:
                     else:
                         logger.warning(f"Failed to save text file for image {file_path}")
 
+        if skipped_count > 0:
+            print(f"Skipped {skipped_count} images that were below the pixel threshold of {min_pixel_threshold}")
+            
         return {"ui": {"images": results}}

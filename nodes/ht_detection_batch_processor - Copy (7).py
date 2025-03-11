@@ -200,85 +200,258 @@ def process_with_model(
     """Process image with model-based scaling to exact target dimensions"""
     import torchvision.transforms.functional as TF
     from PIL import Image
+    # Ensure comfy_extras is available in this scope
+    import comfy_extras.nodes_upscale_model
+    
+    # Ensure image is in BHWC format
+    image = ensure_bhwc_format(image, "process_with_model input")
+
+    # Get current dimensions
+    input_h, input_w = image.shape[1:3]
+
+    # Check if image is too large to process directly
+    if input_h > MAX_PROCESSING_DIM or input_w > MAX_PROCESSING_DIM:
+        print(f"Image too large ({input_w}x{input_h}), downscaling for processing")
+        scale = MAX_PROCESSING_DIM / max(input_h, input_w)
+        temp_h = int(input_h * scale)
+        temp_w = int(input_w * scale)
+        
+        # Downsample using PIL
+        batch_size = image.shape[0]
+        temp_images = []
+        
+        for b in range(batch_size):
+            # Extract single image and convert to numpy
+            img_np = image[b].detach().cpu().numpy()
+            # Ensure values are in 0-1 range
+            if img_np.max() <= 1.0:
+                img_np = (img_np * 255).astype('uint8')
+            else:
+                img_np = img_np.astype('uint8')
+            # Convert to PIL and resize
+            pil_img = Image.fromarray(img_np)
+            resized = pil_img.resize((temp_w, temp_h), Image.Resampling.LANCZOS)
+            # Convert back to tensor
+            tensor = TF.to_tensor(resized).unsqueeze(0)  # Add batch
+            tensor = tensor.permute(0, 2, 3, 1)  # BCHW to BHWC
+            temp_images.append(tensor)
+        
+        # Combine tensors
+        if len(temp_images) > 1:
+            image = torch.cat(temp_images, dim=0)
+        else:
+            image = temp_images[0]
     
     # Ensure dimensions are divisible by divisibility factor
     output_w = get_nearest_divisible_size(target_width, divisibility)
     output_h = get_nearest_divisible_size(target_height, divisibility)
-    
-    # Get current dimensions - assume image is in BHWC format
-    batch_size, input_h, input_w, channels = image.shape
-    print(f"Scaling from {input_w}x{input_h} to {output_w}x{output_h}")
+
+    print(f"Scaling from {input_w}x{input_h} (BHWC) to {output_w}x{output_h} (divisible by {divisibility})")
     
     # Try to use model-based upscaling if available
     if upscale_model is not None:
         try:
-            # Get model scale factor
-            model_scale = getattr(upscale_model, 'scale', 4)
+            # CRITICAL FIX: Bypass model upscaling for ATD models which appear to have dimension issues
+            model_type = getattr(upscale_model, 'model_type', None)
+            if model_type and "ATD" in str(model_type):
+                print(f"Detected ATD model type: {model_type}. Using PIL-based scaling for compatibility.")
+                raise ValueError("ATD model detected - using fallback method")
+                
+            # Ensure we have 3 channels for RGB
+            if image.shape[3] != 3:
+                print(f"Adjusting channel count from {image.shape[3]} to 3")
+                if image.shape[3] > 3:
+                    image = image[:, :, :, :3]  # Take first three channels
+                else:
+                    # Duplicate channels to get 3
+                    image = torch.cat([image] * 3, dim=3)[:, :, :, :3]
             
-            # Calculate intermediate size if needed
+            # Convert BHWC to BCHW for model upscaling (standard PyTorch format)
+            image_bchw = image.permute(0, 3, 1, 2).contiguous()
+            print(f"Converted to BCHW: {image_bchw.shape}")
+            
+            # Get scale factor from model
+            model_scale = getattr(upscale_model, 'scale', 4)
+            print(f"Model scale factor: {model_scale}x")
+            
+            # Use smaller tile size for safety
+            safe_tile_size = min(tile_size, 256)
+            print(f"Using safe tile size: {safe_tile_size}x{safe_tile_size}")
+            
+            # Use Lanczos to get to intermediate size first if needed
             if abs(output_w/input_w - model_scale) > 0.5 or abs(output_h/input_h - model_scale) > 0.5:
                 # We need to resize to an intermediate size first
                 intermediate_w = int(output_w / model_scale)
                 intermediate_h = int(output_h / model_scale)
-                print(f"Intermediate resize to {intermediate_w}x{intermediate_h}")
                 
-                # Convert BHWC to PIL for reliable resizing
-                resized_list = []
-                for b in range(batch_size):
-                    img = image[b].cpu().detach().numpy()
-                    img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-                    pil_img = Image.fromarray(img)
-                    resized = pil_img.resize((intermediate_w, intermediate_h), Image.Resampling.LANCZOS)
-                    resized_list.append(np.array(resized).astype(np.float32) / 255.0)
+                print(f"Using intermediate resize to {intermediate_w}x{intermediate_h} before model upscaling")
                 
-                # Convert back to tensor in BHWC format
-                image = torch.stack([torch.from_numpy(img) for img in resized_list], dim=0)
+                # Resize to intermediate size using F.interpolate
+                image_bchw = F.interpolate(
+                    image_bchw, 
+                    size=(intermediate_h, intermediate_w), 
+                    mode='bicubic', 
+                    align_corners=False
+                ).contiguous()
+                
+                print(f"Intermediate resize complete: {image_bchw.shape}")
             
-            # Convert to BCHW for model
-            image_for_model = image.permute(0, 3, 1, 2).contiguous()
-            print(f"Tensor for model: {image_for_model.shape}")
+            # Ensure dimensions are divisible by 8 for most models
+            c, h, w = image_bchw.shape[1], image_bchw.shape[2], image_bchw.shape[3]
+            if h % 8 != 0 or w % 8 != 0:
+                h_new = (h // 8) * 8
+                w_new = (w // 8) * 8
+                print(f"Adjusting dimensions to be divisible by 8: {w}x{h} -> {w_new}x{h_new}")
+                image_bchw = F.interpolate(
+                    image_bchw, 
+                    size=(h_new, w_new), 
+                    mode='bicubic', 
+                    align_corners=False
+                ).contiguous()
             
-            # Create upscaler instance
-            upscaler = model_upscale.ImageUpscaleWithModel()
+            # Get device safely without assuming parameters() method exists
+            if hasattr(upscale_model, 'device'):
+                device = upscale_model.device
+            elif hasattr(upscale_model, 'model') and hasattr(upscale_model.model, 'parameters'):
+                device = next(upscale_model.model.parameters()).device
+            else:
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                print(f"Could not determine model device, using {device}")
             
-            # Apply upscaling
+            image_bchw = image_bchw.to(device)
+            
+            # For memory efficiency, process in tiles
             with torch.no_grad():
-                result = upscaler.upscale(upscale_model, image_for_model)
-                print(f"Upscaled result: {result.shape}")
+                # Use direct model upscaling instead of tiled to avoid dimension issues
+                print(f"Input tensor shape before upscaling: {image_bchw.shape}")
+                
+                # Verify tensor is properly formed
+                if image_bchw.shape[1] != 3:
+                    raise ValueError(f"Expected 3 channels, got {image_bchw.shape[1]}")
+                if not image_bchw.is_contiguous():
+                    image_bchw = image_bchw.contiguous()
+                    
+                # Try direct upscaling first for more reliable results
+                try:
+                    # Process directly if image is small enough
+                    if image_bchw.shape[2] * image_bchw.shape[3] <= 512 * 512:
+                        print("Using direct model inference (small image)")
+                        result_bchw = upscale_model(image_bchw)
+                    else:
+                        # Create upscaler instance
+                        upscaler = comfy_extras.nodes_upscale_model.ImageUpscaleWithModel()
+                        
+                        # Custom upscale without ComfyUI's tiled_scale which may have dimension issues
+                        print("Using custom tiled upscaling")
+                        
+                        # Implement manual tiling
+                        bs, c, h, w = image_bchw.shape
+                        result_h = h * model_scale
+                        result_w = w * model_scale
+                        result_bchw = torch.zeros((bs, c, result_h, result_w), device=device)
+                        
+                        # Use smaller tiles
+                        actual_tile = min(safe_tile_size, h, w)
+                        actual_overlap = min(overlap, actual_tile // 4)
+                        
+                        # Manual tiling implementation
+                        for y in range(0, h, actual_tile - actual_overlap):
+                            for x in range(0, w, actual_tile - actual_overlap):
+                                # Calculate tile boundaries
+                                y_end = min(y + actual_tile, h)
+                                x_end = min(x + actual_tile, w)
+                                y_start = y
+                                x_start = x
+                                
+                                # Extract tile
+                                tile = image_bchw[:, :, y_start:y_end, x_start:x_end]
+                                
+                                # Upscale tile directly
+                                upscaled_tile = upscale_model(tile)
+                                
+                                # Calculate output positions
+                                out_y_start = y_start * model_scale
+                                out_x_start = x_start * model_scale
+                                out_y_end = y_end * model_scale
+                                out_x_end = x_end * model_scale
+                                
+                                # Place upscaled tile
+                                result_bchw[:, :, out_y_start:out_y_end, out_x_start:out_x_end] = upscaled_tile
+                                
+                except Exception as e:
+                    print(f"Direct model inference failed: {e}")
+                    print("Falling back to ComfyUI upscaler...")
+                    
+                    # Fall back to ComfyUI upscaler
+                    upscaler = comfy_extras.nodes_upscale_model.ImageUpscaleWithModel()
+                    result_bchw = upscaler.upscale(upscale_model, image_bchw)
+                    
+                print(f"Final BCHW shape after upscaling: {result_bchw.shape}")
                 
                 # Convert back to BHWC
-                output = result.permute(0, 2, 3, 1).contiguous()
+                result = result_bchw.permute(0, 2, 3, 1)
                 
-                # Final resize if needed
-                if output.shape[1] != output_h or output.shape[2] != output_w:
-                    # Use PIL for final resize
-                    final_images = []
-                    for b in range(output.shape[0]):
-                        img = output[b].cpu().detach().numpy()
-                        img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-                        pil_img = Image.fromarray(img)
-                        resized = pil_img.resize((output_w, output_h), Image.Resampling.LANCZOS)
-                        final_images.append(np.array(resized).astype(np.float32) / 255.0)
-                    
-                    output = torch.stack([torch.from_numpy(img) for img in final_images], dim=0)
+                # Free memory
+                torch.cuda.empty_cache()
                 
-                return output
+                # Final resize to exact target size if needed
+                if result.shape[1] != output_h or result.shape[2] != output_w:
+                    print(f"Final resize to {output_w}x{output_h}")
+                    final_bchw = result.permute(0, 3, 1, 2)
+                    final_bchw = F.interpolate(
+                        final_bchw, 
+                        size=(output_h, output_w), 
+                        mode='bicubic', 
+                        align_corners=False
+                    )
+                    result = final_bchw.permute(0, 2, 3, 1)
+                
+                return result
                 
         except Exception as e:
             print(f"Error in model-based upscaling: {e}")
             traceback.print_exc()
-            print("Falling back to PIL-based scaling")
+            print("Falling back to PIL-based Lanczos scaling")
     
-    # Fallback to PIL scaling
-    final_images = []
+    # Fallback to PIL-based scaling which is reliable
+    print("Using PIL-based Lanczos scaling")
+    
+    # Convert tensor to PIL images for resizing
+    batch_size = image.shape[0]
+    pil_images = []
+    
     for b in range(batch_size):
-        img = image[b].cpu().detach().numpy()
-        img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-        pil_img = Image.fromarray(img)
-        resized = pil_img.resize((output_w, output_h), Image.Resampling.LANCZOS)
-        final_images.append(np.array(resized).astype(np.float32) / 255.0)
+        # Extract single image and convert to numpy
+        img_np = image[b].detach().cpu().numpy()
+        # Ensure the values are in 0-1 range
+        if img_np.max() <= 1.0:
+            img_np = (img_np * 255).astype('uint8')
+        else:
+            img_np = img_np.astype('uint8')
+        # Convert to PIL
+        pil_img = Image.fromarray(img_np)
+        pil_images.append(pil_img)
     
-    return torch.stack([torch.from_numpy(img) for img in final_images], dim=0)
+    # Resize images using Lanczos resampling
+    resized_pil = []
+    for pil_img in pil_images:
+        resized = pil_img.resize((output_w, output_h), Image.Resampling.LANCZOS)
+        resized_pil.append(resized)
+    
+    # Convert back to tensors
+    result_tensors = []
+    for pil_img in resized_pil:
+        # Convert PIL to Tensor
+        tensor = TF.to_tensor(pil_img).unsqueeze(0)  # Add batch dimension
+        # Convert to BHWC
+        tensor = tensor.permute(0, 2, 3, 1)
+        result_tensors.append(tensor)
+    
+    # Combine tensors into a batch
+    if len(result_tensors) > 1:
+        return torch.cat(result_tensors, dim=0)
+    else:
+        return result_tensors[0]
 
 def match_mask_to_proportions(mask: torch.Tensor, target_w: int, target_h: int, divisibility: int) -> torch.Tensor:
     """Dilate and adjust mask to match target proportions while ensuring divisibility"""
