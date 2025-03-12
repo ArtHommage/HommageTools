@@ -231,10 +231,6 @@ def process_with_model(
                     resized = pil_img.resize((intermediate_w, intermediate_h), Image.Resampling.LANCZOS)
                     resized_list.append(np.array(resized).astype(np.float32) / 255.0)
                 
-                # Free the original image tensor
-                del image
-                torch.cuda.empty_cache()
-                
                 # Convert back to tensor in BHWC format
                 image = torch.stack([torch.from_numpy(img) for img in resized_list], dim=0)
             
@@ -250,10 +246,6 @@ def process_with_model(
                 result = upscaler.upscale(upscale_model, image_for_model)
                 print(f"Upscaled result: {result.shape}")
                 
-                # Free the intermediate image tensor
-                del image_for_model
-                torch.cuda.empty_cache()
-                
                 # Convert back to BHWC
                 output = result.permute(0, 2, 3, 1).contiguous()
                 
@@ -267,10 +259,6 @@ def process_with_model(
                         pil_img = Image.fromarray(img)
                         resized = pil_img.resize((output_w, output_h), Image.Resampling.LANCZOS)
                         final_images.append(np.array(resized).astype(np.float32) / 255.0)
-                    
-                    # Free the intermediate output tensor
-                    del output
-                    torch.cuda.empty_cache()
                     
                     output = torch.stack([torch.from_numpy(img) for img in final_images], dim=0)
                 
