@@ -1,0 +1,134 @@
+# ComfyUI Node Development Guidelines
+Version: 1.0.0
+Last Updated: 2024-01-12
+
+## Core Principles for Node Development
+
+### 1. Initialization and Imports
+- Keep imports minimal and at the top of the file
+- Use absolute imports instead of relative imports
+- Import only what is needed, avoid importing entire packages
+- Avoid initialization logic in `__init__` methods unless absolutely necessary
+
+### 2. Node Structure
+- Use clear, consistent class names prefixed with project identifier (e.g., "HT" for HommageTools)
+- Keep class attributes minimal and static
+- Define `CATEGORY`, `FUNCTION`, `RETURN_TYPES`, and `RETURN_NAMES` as class attributes
+- Place category in a project-specific folder (e.g., "HommageTools/SubCategory")
+
+### 3. Input Configuration
+```python
+@classmethod
+def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
+    return {
+        "required": {
+            "param_name": ("TYPE", {
+                "default": default_value,
+                # Only include necessary configuration
+            })
+        }
+    }
+```
+
+### 4. Error Handling
+- Minimize error handling to essential operations only
+- Return safe default values instead of raising errors when possible
+- Avoid complex try/except blocks
+- Never use logging in node code
+
+### 5. Node Functions
+- Keep processing functions simple and focused
+- Return tuples with correctly typed values
+- Use type hints consistently
+- Avoid complex state management
+- Split complex operations into smaller, manageable functions
+
+### 6. Performance Considerations
+- Avoid heavy computations during node initialization
+- Don't store large amounts of data in node instances
+- Process data only when necessary
+- Use efficient data structures and algorithms
+
+### 7. File Organization
+```
+project_root/
+  ├── __init__.py        # Minimal registration code
+  ├── nodes/
+  │   ├── node_type1.py  # Related nodes in single files
+  │   └── node_type2.py
+  └── requirements.txt
+```
+
+### 8. Node Registration in __init__.py
+```python
+import os
+from typing import Dict, Type, Any
+
+NODES_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "nodes")
+
+# Direct imports
+from .nodes.node_file import NodeClass
+
+NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
+    "NodeClass": NodeClass
+}
+
+NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
+    "NodeClass": "Display Name"
+}
+
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+```
+
+## Example Node Template
+```python
+"""
+File: project_name/nodes/node_name.py
+Version: 1.0.0
+Description: Brief description of node functionality
+"""
+
+from typing import Dict, Any, Tuple
+
+class ProjectNodeName:
+    """Single line description."""
+    
+    CATEGORY = "ProjectName"
+    FUNCTION = "process_data"
+    RETURN_TYPES = ("TYPE1", "TYPE2")
+    RETURN_NAMES = ("output1", "output2")
+    
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "required": {
+                "input1": ("STRING", {
+                    "default": ""
+                })
+            }
+        }
+
+    def process_data(self, input1: str) -> Tuple[str, int]:
+        # Process data
+        result1 = input1.strip()
+        result2 = len(result1)
+        return (result1, result2)
+```
+
+## Common Issues to Avoid
+1. Complex error handling and logging
+2. Heavy initialization code
+3. Complex state management
+4. Unnecessary input parameters
+5. Overly complex inheritance structures
+6. Dynamic imports
+7. Global state
+8. Complex file operations during initialization
+
+## Testing Guidelines
+1. Add nodes one at a time to the initialization
+2. Test each node in isolation before adding more
+3. Keep node dependencies minimal
+4. Monitor UI responsiveness during testing
+5. Verify node behavior with different input types
+6. Test edge cases with safe fallbacks

@@ -45,6 +45,9 @@ from .nodes.ht_resize_node import HTResizeNode
 # from .nodes.ht_oidn_node import HTOIDNNode
 from .nodes.ht_save_image_plus import HTSaveImagePlus
 from .nodes.ht_detection_batch_processor import HTDetectionBatchProcessor
+# Import the mappings instead of the class
+from .nodes.ht_detection_batch_processor_v2 import NODE_CLASS_MAPPINGS as HT_V2_MAPPINGS
+from .nodes.ht_detection_batch_processor_v2 import NODE_DISPLAY_NAME_MAPPINGS as HT_V2_DISPLAY_MAPPINGS
 
 # Dimension Handling Nodes
 from .nodes.ht_resolution_node import HTResolutionNode
@@ -99,6 +102,7 @@ NODE_CLASS_MAPPINGS = {
 #    "HTOIDNNode": HTOIDNNode,
     "HTSaveImagePlus": HTSaveImagePlus,
     "HTDetectionBatchProcessor": HTDetectionBatchProcessor,
+    # Removed the direct class reference
     
     # Dimension Handling
     "HTResolutionNode": HTResolutionNode,
@@ -152,6 +156,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 #    "HTOIDNNode": "HT Intel Denoiser",
     "HTSaveImagePlus": "HT Save Image Plus",
     "HTDetectionBatchProcessor": "HT Detection Batch Processor",
+    # Removed the direct display name mapping
     
     # Dimension Handling
     "HTResolutionNode": "HT Resolution",
@@ -188,6 +193,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # Model Management
     "HTDiffusionLoaderMulti": "HT Multi Model Loader"
 }
+
+# Update the node mappings with the imported mappings
+NODE_CLASS_MAPPINGS.update(HT_V2_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(HT_V2_DISPLAY_MAPPINGS)
 
 #------------------------------------------------------------------------------
 # Section 4: Exports
