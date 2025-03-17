@@ -1,356 +1,847 @@
-"""
-File: homage_tools/nodes/ht_detection_batch_processor_v2.py
-Version: 2.0.0
-Description: Enhanced node for detecting regions, applying mask dilation, and processing with model-based upscaling
-             Using UltimateSDUpscaler-style tiled processing for better quality and memory efficiency
-             Processes each detected region independently while maintaining aspect ratio
-"""
+#######################################################
+# SECTION 1: CORE DEFINITIONS AND ENUMS
+#######################################################
 
-import os
-import json
 import math
+import copy
 import numpy as np
-from enum import Enum
-from tqdm import tqdm
-from typing import Any, List, Tuple, Optional, Dict, Union
-
 import torch
-from PIL import Image, ImageFilter
+from PIL import Image
+from enum import Enum
 
-import comfy
-from comfy.samplers import KSampler
-from comfy_extras.nodes_custom_sampler import SamplerCustom
-from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
+# Enum for scale mode
+class ScaleMode(Enum):
+    MAX = "max"  # Scale up to 1024 regardless
+    UP = "up"    # Scale up to next closest bucket
+    DOWN = "down"  # Scale down to next closest bucket
+    CLOSEST = "closest"  # Scale to closest bucket
 
-# Ensure backward compatibility with older Pillow versions
-if not hasattr(Image, 'Resampling'):
-    Image.Resampling = Image
+# Enum for short edge divisibility
+class ShortEdgeDivisibility(Enum):
+    DIV_BY_8 = 8
+    DIV_BY_64 = 64
 
-#-------------------------------------------------------
+# Target bucket sizes
+BUCKET_SIZES = [1024, 768, 512]
+MAX_BUCKET_SIZE = 1024
+
 # Constants
-#-------------------------------------------------------
 MAX_RESOLUTION = 8192
+BLUR_KERNEL_SIZE = 15
 
-#-------------------------------------------------------
-# Utility Functions
-#-------------------------------------------------------
-
-def pil_to_tensor(image):
-    """Convert PIL image to PyTorch tensor"""
-    img = np.array(image).astype(np.float32) / 255.0
-    img = torch.from_numpy(img)[None,]
-    return img.permute(0, 3, 1, 2)
-
-def tensor_to_pil(tensor, index=0):
-    """Convert PyTorch tensor to PIL image"""
-    try:
-        # Check tensor shape and format
-        if len(tensor.shape) != 4:
-            raise ValueError(f"Expected 4D tensor (BCHW or BHWC), got shape {tensor.shape}")
-        
-        # Handle different dimension orders
-        if tensor.shape[1] <= 4 and tensor.shape[2] > 4 and tensor.shape[3] > 4:
-            # BCHW format - permute to BHWC for processing
-            tensor = tensor.permute(0, 2, 3, 1)
-        
-        # Extract the specified image from batch
-        if index >= tensor.shape[0]:
-            raise IndexError(f"Index {index} out of bounds for tensor with batch size {tensor.shape[0]}")
-        
-        img_tensor = tensor[index]
-        
-        # Scale values to 0-255 range
-        i = 255.0 * img_tensor.cpu().numpy()
-        i = np.clip(i, 0, 255).astype(np.uint8)
-        
-        return Image.fromarray(i)
-    except Exception as e:
-        print(f"Error in tensor_to_pil: {e}, tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
-        # Try fallback conversion for unusual tensor shapes
-        try:
-            # For single channel tensors with unusual dimensions
-            if len(tensor.shape) == 3 and tensor.shape[0] == 1 and tensor.shape[1] == 1:
-                # Reshape to create a valid image (e.g., square dimensions)
-                size = int(math.sqrt(tensor.shape[2]))
-                reshaped = tensor[0, 0].reshape(size, size).cpu().numpy()
-                return Image.fromarray((reshaped * 255).astype(np.uint8), 'L')
-            # Basic reshape attempt
-            elif len(tensor.shape) == 3:
-                return Image.fromarray((tensor[0].cpu().numpy() * 255).astype(np.uint8))
-            else:
-                # Last resort fallback - create blank image with error message
-                img = Image.new('RGB', (256, 256), color=(50, 50, 50))
-                print(f"Could not convert tensor with shape {tensor.shape} to PIL image")
-                return img
-        except Exception as e2:
-            print(f"Fallback conversion also failed: {e2}")
-            return Image.new('RGB', (256, 256), color=(100, 0, 0))
-
-def get_crop_region(mask, padding):
-    """Find the bounding box of the non-zero region in the mask"""
-    w, h = mask.size
-    x_min, y_min, x_max, y_max = w, h, 0, 0
-    
-    for y in range(h):
-        for x in range(w):
-            if mask.getpixel((x, y)) > 0:
-                x_min = min(x, x_min)
-                y_min = min(y, y_min)
-                x_max = max(x, x_max)
-                y_max = max(y, y_max)
-    
-    # Add padding
-    x_min = max(0, x_min - padding)
-    y_min = max(0, y_min - padding)
-    x_max = min(w, x_max + padding)
-    y_max = min(h, y_max + padding)
-    
-    return (x_min, y_min, x_max, y_max)
-
-def expand_crop(crop, width, height, target_width, target_height):
-    """Expand crop region to match target dimensions"""
-    x1, y1, x2, y2 = crop
-    current_width = x2 - x1
-    current_height = y2 - y1
-    
-    # Calculate how much to expand in each direction
-    expand_x = max(0, target_width - current_width)
-    expand_y = max(0, target_height - current_height)
-    
-    # Expand evenly in both directions
-    new_x1 = max(0, x1 - expand_x // 2)
-    new_y1 = max(0, y1 - expand_y // 2)
-    new_x2 = min(width, x2 + (expand_x - expand_x // 2))
-    new_y2 = min(height, y2 + (expand_y - expand_y // 2))
-    
-    # Calculate the actual size after clamping
-    actual_width = new_x2 - new_x1
-    actual_height = new_y2 - new_y1
-    
-    return (new_x1, new_y1, new_x2, new_y2), (actual_width, actual_height)
-
-def crop_cond(cond, crop_region, original_size, image_size, crop_size):
-    """Crop conditioning to match the crop region"""
-    x1, y1, x2, y2 = crop_region
-    w, h = original_size
-    crop_w, crop_h = crop_size
-    img_w, img_h = image_size
-    
-    scale_x = crop_w / (x2 - x1)
-    scale_y = crop_h / (y2 - y1)
-    
-    # Create a copy of the conditioning to avoid modifying the original
-    cropped_cond = []
-    for c in cond:
-        n_cond = c[1].copy()
-        n_area = c[2].copy() if len(c) > 2 else None
-        
-        # Scale the area
-        if n_area is not None:
-            # Adjust conditioning area to match crop
-            area_x, area_y, area_w, area_h = n_area
-            # Convert to image coordinates
-            area_x = area_x * img_w
-            area_y = area_y * img_h
-            area_w = area_w * img_w
-            area_h = area_h * img_h
-            
-            # Adjust to crop coordinates
-            area_x = (area_x - x1) * scale_x / crop_w
-            area_y = (area_y - y1) * scale_y / crop_h
-            area_w = area_w * scale_x / crop_w
-            area_h = area_h * scale_y / crop_h
-            
-            # Clamp values
-            area_x = max(0, min(1, area_x))
-            area_y = max(0, min(1, area_y))
-            area_w = max(0, min(1 - area_x, area_w))
-            area_h = max(0, min(1 - area_y, area_h))
-            
-            n_area = [area_x, area_y, area_w, area_h]
-        
-        if n_area is not None:
-            cropped_cond.append([c[0], n_cond, n_area])
-        else:
-            cropped_cond.append([c[0], n_cond])
-    
-    return cropped_cond
-
-def dilate_mask_opencv(mask_np, dilation_value):
-    """Dilate mask using OpenCV"""
-    import cv2
-    
-    if dilation_value == 0:
-        return mask_np
-        
-    # Convert to uint8 for OpenCV
-    binary_mask = (mask_np * 255).astype(np.uint8)
-    
-    # Create kernel for dilation/erosion
-    kernel_size = abs(dilation_value)
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    
-    # Apply dilation or erosion
-    if dilation_value > 0:
-        dilated = cv2.dilate(binary_mask, kernel, iterations=1)
-    else:
-        dilated = cv2.erode(binary_mask, kernel, iterations=1)
-        
-    # Convert back to float [0,1]
-    return dilated.astype(float) / 255.0
-
-def tensor_gaussian_blur_mask(mask_tensor, blur_size):
-    """Apply gaussian blur to mask tensor using OpenCV"""
-    import cv2
-    
-    # Extract mask and convert to numpy (handling batch if needed)
-    if len(mask_tensor.shape) == 4:  # BHWC
-        # Process each batch independently
-        result = []
-        for b in range(mask_tensor.shape[0]):
-            img = mask_tensor[b, ..., 0].detach().cpu().numpy()
-            # Apply blur (must be odd size)
-            blur_amount = blur_size if blur_size % 2 == 1 else blur_size + 1
-            blurred = cv2.GaussianBlur(img, (blur_amount, blur_amount), 0)
-            result.append(torch.from_numpy(blurred).unsqueeze(-1))
-        return torch.stack(result, dim=0)
-    else:  # HWC
-        img = mask_tensor[..., 0].detach().cpu().numpy()
-        # Apply blur (must be odd size)
-        blur_amount = blur_size if blur_size % 2 == 1 else blur_size + 1
-        blurred = cv2.GaussianBlur(img, (blur_amount, blur_amount), 0)
-        return torch.from_numpy(blurred).unsqueeze(-1)
-
-def flatten(img, bgcolor):
-    """Replace transparency with bgcolor"""
-    if img.mode in ("RGB"):
-        return img
-    return Image.alpha_composite(Image.new("RGBA", img.size, bgcolor), img).convert("RGB")
-
-def get_nearest_divisible_size(size, divisor):
-    """Calculate nearest size divisible by divisor."""
-    return ((size + divisor - 1) // divisor) * divisor
-
-def ensure_bhwc_format(tensor):
-    """
-    Ensures that a tensor is in BHWC format (batch, height, width, channels).
-    Handles unusual tensor shapes and adds proper error handling.
-    """
-    # Handle empty tensors
-    if tensor is None or tensor.numel() == 0:
-        raise ValueError("Empty tensor provided")
-        
-    # Add batch dimension if missing
-    if len(tensor.shape) == 3:
-        tensor = tensor.unsqueeze(0)
-        
-    # Handle unusual shapes
-    if len(tensor.shape) == 4:
-        # Check if it's in BCHW format (typical PyTorch format)
-        if tensor.shape[1] <= 4 and tensor.shape[2] > 4 and tensor.shape[3] > 4:
-            # Convert BCHW to BHWC
-            return tensor.permute(0, 2, 3, 1)
-        # Already in BHWC format
-        elif tensor.shape[3] <= 4:
-            return tensor
-        else:
-            # Unusual tensor shape - try to reshape intelligently
-            print(f"Warning: Unusual tensor shape {tensor.shape}, attempting to reshape")
-            
-            # Case: Single channel but stretched out (like [1, 1, N])
-            if tensor.shape[1] == 1 and tensor.shape[2] == 1 and tensor.shape[3] > 16:
-                # Reshape to square if possible
-                size = int(math.sqrt(tensor.shape[3]))
-                if size * size == tensor.shape[3]:
-                    return tensor.reshape(tensor.shape[0], size, size, 1)
-                else:
-                    # Not a perfect square, use closest dimensions
-                    h = size
-                    w = tensor.shape[3] // h
-                    return tensor.reshape(tensor.shape[0], h, w, 1)
-    
-    # If we got here, return the original tensor
-    return tensor
-
-#-------------------------------------------------------
-# Core Processing Components
-#-------------------------------------------------------
-
+# USDU Enums
 class USDUMode(Enum):
-    """Redraw modes for USDU"""
     LINEAR = 0
     CHESS = 1
     NONE = 2
 
 class USDUSFMode(Enum):
-    """Seam fix modes for USDU"""
     NONE = 0
     BAND_PASS = 1
     HALF_TILE = 2
     HALF_TILE_PLUS_INTERSECTIONS = 3
 
-class Upscaler:
-    """Handles image upscaling with or without a model"""
-    def __init__(self, upscaler_model=None):
-        self.upscaler_model = upscaler_model
+# The modes available for Ultimate SD Upscale
+MODES = {
+    "Linear": USDUMode.LINEAR,
+    "Chess": USDUMode.CHESS,
+    "None": USDUMode.NONE,
+}
+
+# The seam fix modes
+SEAM_FIX_MODES = {
+    "None": USDUSFMode.NONE,
+    "Band Pass": USDUSFMode.BAND_PASS,
+    "Half Tile": USDUSFMode.HALF_TILE,
+    "Half Tile + Intersections": USDUSFMode.HALF_TILE_PLUS_INTERSECTIONS,
+}
+#######################################################
+# SECTION 2: UTILITY AND HELPER FUNCTIONS
+#######################################################
+
+def tensor_to_pil(img_tensor, batch_index=0):
+    """Convert a tensor to a PIL image."""
+    img_tensor = img_tensor[batch_index].unsqueeze(0)
+    i = 255. * img_tensor.cpu().numpy()
+    img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8).squeeze())
+    return img
+
+def pil_to_tensor(image):
+    """Convert a PIL image to a tensor."""
+    image = np.array(image).astype(np.float32) / 255.0
+    image = torch.from_numpy(image).unsqueeze(0)
+    if len(image.shape) == 3:  # If the image is grayscale, add a channel dimension
+        image = image.unsqueeze(-1)
+    return image
+
+def get_crop_region(mask, pad=0):
+    """Get crop region from a mask."""
+    coordinates = mask.getbbox()
+    if coordinates is not None:
+        x1, y1, x2, y2 = coordinates
+    else:
+        x1, y1, x2, y2 = mask.width, mask.height, 0, 0
+    # Apply padding
+    x1 = max(x1 - pad, 0)
+    y1 = max(y1 - pad, 0)
+    x2 = min(x2 + pad, mask.width)
+    y2 = min(y2 + pad, mask.height)
+    return fix_crop_region((x1, y1, x2, y2), (mask.width, mask.height))
+
+def fix_crop_region(region, image_size):
+    """Fix crop region boundaries."""
+    image_width, image_height = image_size
+    x1, y1, x2, y2 = region
+    if x2 < image_width:
+        x2 -= 1
+    if y2 < image_height:
+        y2 -= 1
+    return x1, y1, x2, y2
+
+def expand_crop(region, width, height, target_width, target_height):
+    """Expand a crop region to a target size."""
+    x1, y1, x2, y2 = region
+    actual_width = x2 - x1
+    actual_height = y2 - y1
+
+    # Try to expand region to the right
+    width_diff = target_width - actual_width
+    x2 = min(x2 + width_diff // 2, width)
+    # Expand region to the left
+    width_diff = target_width - (x2 - x1)
+    x1 = max(x1 - width_diff, 0)
+    # Try the right again
+    width_diff = target_width - (x2 - x1)
+    x2 = min(x2 + width_diff, width)
+
+    # Try to expand region to the bottom
+    height_diff = target_height - actual_height
+    y2 = min(y2 + height_diff // 2, height)
+    # Expand region to the top
+    height_diff = target_height - (y2 - y1)
+    y1 = max(y1 - height_diff, 0)
+    # Try the bottom again
+    height_diff = target_height - (y2 - y1)
+    y2 = min(y2 + height_diff, height)
+
+    return (x1, y1, x2, y2), (target_width, target_height)
+
+def crop_tensor(tensor, region):
+    """Crop a tensor to a specified region."""
+    x1, y1, x2, y2 = region
+    return tensor[:, y1:y2, x1:x2, :]
+
+def resize_tensor(tensor, size, mode="nearest-exact"):
+    """Resize a tensor to specified dimensions."""
+    return torch.nn.functional.interpolate(tensor, size=size, mode=mode)
+
+def resize_region(region, init_size, resize_size):
+    """Resize a crop region based on image resize."""
+    x1, y1, x2, y2 = region
+    init_width, init_height = init_size
+    resize_width, resize_height = resize_size
+    x1 = math.floor(x1 * resize_width / init_width)
+    x2 = math.ceil(x2 * resize_width / init_width)
+    y1 = math.floor(y1 * resize_height / init_height)
+    y2 = math.ceil(y2 * resize_height / init_height)
+    return (x1, y1, x2, y2)
+
+def region_intersection(region1, region2):
+    """Find the intersection of two rectangular regions."""
+    x1, y1, x2, y2 = region1
+    x1_, y1_, x2_, y2_ = region2
+    x1 = max(x1, x1_)
+    y1 = max(y1, y1_)
+    x2 = min(x2, x2_)
+    y2 = min(y2, y2_)
+    if x1 >= x2 or y1 >= y2:
+        return None
+    return (x1, y1, x2, y2)
+
+def pad_image2(image, left_pad, right_pad, top_pad, bottom_pad, fill=False, blur=False):
+    """Pad an image with pixels on each side."""
+    left_edge = image.crop((0, 1, 1, image.height - 1))
+    right_edge = image.crop((image.width - 1, 1, image.width, image.height - 1))
+    top_edge = image.crop((1, 0, image.width - 1, 1))
+    bottom_edge = image.crop((1, image.height - 1, image.width - 1, image.height))
+    new_width = image.width + left_pad + right_pad
+    new_height = image.height + top_pad + bottom_pad
+    padded_image = Image.new(image.mode, (new_width, new_height))
+    padded_image.paste(image, (left_pad, top_pad))
+    if fill:
+        if left_pad > 0:
+            padded_image.paste(left_edge.resize((left_pad, new_height), resample=Image.Resampling.NEAREST), (0, 0))
+        if right_pad > 0:
+            padded_image.paste(right_edge.resize((right_pad, new_height),
+                              resample=Image.Resampling.NEAREST), (new_width - right_pad, 0))
+        if top_pad > 0:
+            padded_image.paste(top_edge.resize((new_width, top_pad), resample=Image.Resampling.NEAREST), (0, 0))
+        if bottom_pad > 0:
+            padded_image.paste(bottom_edge.resize((new_width, bottom_pad),
+                              resample=Image.Resampling.NEAREST), (0, new_height - bottom_pad))
+        if blur and not (left_pad == right_pad == top_pad == bottom_pad == 0):
+            padded_image = padded_image.filter(ImageFilter.GaussianBlur(BLUR_KERNEL_SIZE))
+            padded_image.paste(image, (left_pad, top_pad))
+    return padded_image
+
+def resize_and_pad_image(image, width, height, fill=False, blur=False):
+    """Resize an image and pad it to specified dimensions."""
+    width_ratio = width / image.width
+    height_ratio = height / image.height
+    if height_ratio > width_ratio:
+        resize_ratio = width_ratio
+    else:
+        resize_ratio = height_ratio
+    resize_width = round(image.width * resize_ratio)
+    resize_height = round(image.height * resize_ratio)
+    resized = image.resize((resize_width, resize_height), resample=Image.Resampling.LANCZOS)
+    # Pad the sides of the image to get the image to the desired size that wasn't covered by the resize
+    horizontal_pad = (width - resize_width) // 2
+    vertical_pad = (height - resize_height) // 2
+    result = pad_image2(resized, horizontal_pad, horizontal_pad, vertical_pad, vertical_pad, fill, blur)
+    result = result.resize((width, height), resample=Image.Resampling.LANCZOS)
+    return result, (horizontal_pad, vertical_pad)
+#######################################################
+# SECTION 3: BUCKET-RELATED CORE LOGIC
+#######################################################
+
+# Helper function to calculate target bucket dimensions
+def calculate_bucket_dimensions(width, height, scale_mode, short_edge_div, mask_dilation=1.0):
+    """
+    Calculate the target dimensions based on bucket constraints.
     
-    def _upscale(self, img, scale):
+    Args:
+        width: Original width
+        height: Original height
+        scale_mode: ScaleMode enum value
+        short_edge_div: ShortEdgeDivisibility enum value
+        mask_dilation: Factor to dilate the mask by before calculating target dimensions
+    
+    Returns:
+        tuple: (target_width, target_height, scale_type, bucket_size)
+    """
+    # Apply dilation factor to dimensions
+    width = int(width * mask_dilation)
+    height = int(height * mask_dilation)
+    
+    # Determine long and short edges
+    is_landscape = width >= height
+    long_edge = width if is_landscape else height
+    short_edge = height if is_landscape else width
+    
+    # Cap at MAX_BUCKET_SIZE if larger
+    if long_edge > MAX_BUCKET_SIZE:
+        target_long_edge = MAX_BUCKET_SIZE
+        scale_type = "down"
+    else:
+        # Select target bucket based on scale mode
+        if scale_mode == ScaleMode.MAX:
+            # Always scale up to MAX_BUCKET_SIZE
+            target_long_edge = MAX_BUCKET_SIZE
+            scale_type = "up" if long_edge < MAX_BUCKET_SIZE else "same"
+        elif scale_mode == ScaleMode.UP:
+            # Find the next bucket size up
+            larger_buckets = [b for b in BUCKET_SIZES if b > long_edge]
+            if larger_buckets:
+                target_long_edge = min(larger_buckets)
+                scale_type = "up"
+            else:
+                target_long_edge = MAX_BUCKET_SIZE
+                scale_type = "max"
+        elif scale_mode == ScaleMode.DOWN:
+            # Find the next bucket size down
+            smaller_buckets = [b for b in BUCKET_SIZES if b < long_edge]
+            if smaller_buckets:
+                target_long_edge = max(smaller_buckets)
+                scale_type = "down"
+            else:
+                target_long_edge = min(BUCKET_SIZES)
+                scale_type = "min"
+        else:  # CLOSEST
+            # Find the closest bucket size
+            closest_bucket = min(BUCKET_SIZES, key=lambda b: abs(b - long_edge))
+            target_long_edge = closest_bucket
+            scale_type = "up" if closest_bucket > long_edge else "down" if closest_bucket < long_edge else "same"
+    
+    # Calculate scaling factor
+    scale_factor = target_long_edge / long_edge
+    
+    # Calculate raw short edge size after scaling
+    raw_short_edge = short_edge * scale_factor
+    
+    # Adjust short edge to be divisible by the specified divisor
+    divisor = short_edge_div.value
+    adjusted_short_edge = math.ceil(raw_short_edge / divisor) * divisor
+    
+    # Calculate final dimensions
+    if is_landscape:
+        target_width = target_long_edge
+        target_height = adjusted_short_edge
+    else:
+        target_width = adjusted_short_edge
+        target_height = target_long_edge
+    
+    return (target_width, target_height, scale_type, target_long_edge)
+
+# Helper function to adjust crop regions to fit target bucket
+def adjust_crop_to_bucket(crop_region, original_img_size, scale_mode, short_edge_div, mask_dilation=1.0):
+    """
+    Adjust a crop region to fit into the target bucket dimensions.
+    
+    Args:
+        crop_region: Tuple (x1, y1, x2, y2) defining the crop
+        original_img_size: Tuple (width, height) of the original image
+        scale_mode: ScaleMode enum value
+        short_edge_div: ShortEdgeDivisibility enum value
+        mask_dilation: Factor to dilate the mask by before calculating target dimensions
+    
+    Returns:
+        tuple: (adjusted_crop_region, target_dimensions, scale_type, bucket_size)
+    """
+    x1, y1, x2, y2 = crop_region
+    img_width, img_height = original_img_size
+    
+    # Current crop dimensions
+    crop_width = x2 - x1
+    crop_height = y2 - y1
+    
+    # Apply mask dilation
+    if mask_dilation != 1.0:
+        # Calculate expansion needed
+        width_expansion = int(crop_width * (mask_dilation - 1))
+        height_expansion = int(crop_height * (mask_dilation - 1))
+        
+        # Apply expansion evenly on all sides
+        x1 = max(0, x1 - width_expansion // 2)
+        y1 = max(0, y1 - height_expansion // 2)
+        x2 = min(img_width, x2 + width_expansion // 2)
+        y2 = min(img_height, y2 + height_expansion // 2)
+        
+        # Update dimensions
+        crop_width = x2 - x1
+        crop_height = y2 - y1
+    
+    # Calculate target dimensions for this crop
+    target_width, target_height, scale_type, bucket_size = calculate_bucket_dimensions(
+        crop_width, crop_height, scale_mode, short_edge_div
+    )
+    
+    # Calculate required expansion to achieve target ratio
+    target_ratio = target_width / target_height
+    current_ratio = crop_width / crop_height
+    
+    # Adjust crop to match target ratio
+    if current_ratio > target_ratio:
+        # Width is the limiting factor, adjust height
+        new_height = crop_width / target_ratio
+        height_diff = new_height - crop_height
+        y1 = max(0, y1 - height_diff / 2)
+        y2 = min(img_height, y2 + height_diff / 2)
+    else:
+        # Height is the limiting factor, adjust width
+        new_width = crop_height * target_ratio
+        width_diff = new_width - crop_width
+        x1 = max(0, x1 - width_diff / 2)
+        x2 = min(img_width, x2 + width_diff / 2)
+    
+    # Ensure the crop values are integers
+    adjusted_crop = (int(x1), int(y1), int(x2), int(y2))
+    target_dims = (int(target_width), int(target_height))
+    
+    return adjusted_crop, target_dims, scale_type, bucket_size
+
+# Function to process a batch of SEGS with bucket adjustments
+def process_segs_with_buckets(segs, original_image, scale_mode, short_edge_div, mask_dilation=1.0):
+    """
+    Process SEGS to fit into specified buckets.
+    
+    Args:
+        segs: SEGS object containing segmentation information
+        original_image: The original image tensor
+        scale_mode: ScaleMode enum value
+        short_edge_div: ShortEdgeDivisibility enum value
+        mask_dilation: Factor to dilate the mask before calculating target dimensions
+    
+    Returns:
+        tuple: (image_batch, crop_regions, target_dimensions, scale_types, bucket_sizes)
+    """
+    if segs is None or len(segs[1]) == 0:
+        # Create a 1x1 black pixel image tensor for empty SEGS
+        empty_tensor = torch.zeros(1, 1, 1, 3)
+        return empty_tensor, [], [], [], []
+    
+    image_crops = []
+    crop_regions = []
+    target_dimensions = []
+    scale_types = []
+    bucket_sizes = []
+    
+    img_height, img_width = original_image.shape[1:3]
+    original_img_size = (img_width, img_height)
+    
+    for seg in segs[1]:
+        # Get crop region
+        x1, y1, x2, y2 = seg.crop_region
+        
+        # Adjust crop region to fit target bucket
+        adjusted_crop, target_dims, scale_type, bucket_size = adjust_crop_to_bucket(
+            (x1, y1, x2, y2), original_img_size, scale_mode, short_edge_div, mask_dilation
+        )
+        
+        # Update with adjusted crop
+        ax1, ay1, ax2, ay2 = adjusted_crop
+        
+        # Store information
+        crop_regions.append(adjusted_crop)
+        target_dimensions.append(target_dims)
+        scale_types.append(scale_type)
+        bucket_sizes.append(bucket_size)
+        
+        # Crop the image with adjusted coordinates
+        cropped_image = original_image[:, ay1:ay2, ax1:ax2, :]
+        image_crops.append(cropped_image)
+    
+    # Stack the crops into a batch
+    if len(image_crops) > 0:
+        image_batch = torch.cat(image_crops, dim=0)
+        return image_batch, crop_regions, target_dimensions, scale_types, bucket_sizes
+    else:
+        # Fallback 1x1 black pixel for safety
+        empty_tensor = torch.zeros(1, 1, 1, 3)
+        return empty_tensor, [], [], [], []
+
+# Add the standard segs_to_image_batch function for compatibility
+def segs_to_image_batch(segs, original_image):
+    """
+    Convert SEGS to a batch of image crops for processing.
+    
+    Args:
+        segs: SEGS object containing segmentation information
+        original_image: The original image tensor
+    
+    Returns:
+        Image batch tensor, crop_regions list
+    """
+    if segs is None or len(segs[1]) == 0:
+        # Create a 1x1 black pixel image tensor for empty SEGS
+        empty_tensor = torch.zeros(1, 1, 1, 3)
+        return empty_tensor, []
+    
+    image_crops = []
+    crop_regions = []
+    
+    for seg in segs[1]:
+        # Get crop region
+        x1, y1, x2, y2 = seg.crop_region
+        crop_regions.append(seg.crop_region)
+        
+        # Crop the image
+        cropped_image = original_image[:, y1:y2, x1:x2, :]
+        image_crops.append(cropped_image)
+    
+    # Stack the crops into a batch
+    if len(image_crops) > 0:
+        image_batch = torch.cat(image_crops, dim=0)
+        return image_batch, crop_regions
+    else:
+        # Fallback 1x1 black pixel for safety
+        empty_tensor = torch.zeros(1, 1, 1, 3)
+        return empty_tensor, []
+
+# Helper function to reconstruct the full image from processed crops
+def reconstruct_from_crops(original_image, processed_crops, crop_regions):
+    """
+    Reconstruct a full image from processed crops.
+    
+    Args:
+        original_image: The original image tensor (used as base)
+        processed_crops: The processed (upscaled) image crops
+        crop_regions: List of crop regions (x1, y1, x2, y2)
+    
+    Returns:
+        Reconstructed image tensor
+    """
+    # Create a copy of the original image to modify
+    result_image = copy.deepcopy(original_image)
+    
+    # For each crop, place it back in the original image at the crop region
+    for i, crop_region in enumerate(crop_regions):
+        x1, y1, x2, y2 = crop_region
+        
+        # Handle differently sized crops (if upscaled)
+        crop = processed_crops[i]
+        
+        # Resize crop to fit original region if needed
+        if crop.shape[1] != y2-y1 or crop.shape[2] != x2-x1:
+            from torchvision.transforms.functional import resize
+            # Resize to match the original crop region
+            crop = resize(crop, (y2-y1, x2-x1))
+        
+        # Place the crop back in the result image
+        result_image[:, y1:y2, x1:x2, :] = crop
+    
+    return result_image
+#######################################################
+# SECTION 4: CONDITIONING-RELATED FUNCTIONS
+#######################################################
+
+def crop_controlnet(cond_dict, region, init_size, canvas_size, tile_size, w_pad=0, h_pad=0):
+    """
+    Crop ControlNet conditioning to match the current region.
+    
+    Args:
+        cond_dict: Conditioning dictionary 
+        region: Tuple (x1, y1, x2, y2) defining the crop region
+        init_size: Original image size
+        canvas_size: Size of the canvas
+        tile_size: Size of the tile
+        w_pad: Width padding
+        h_pad: Height padding
+    """
+    if "control" not in cond_dict:
+        return
+    c = cond_dict["control"]
+    controlnet = c.copy()
+    cond_dict["control"] = controlnet
+    while c is not None:
+        # hint is shape (B, C, H, W)
+        hint = controlnet.cond_hint_original
+        resized_crop = resize_region(region, canvas_size, hint.shape[:-3:-1])
+        hint = crop_tensor(hint.movedim(1, -1), resized_crop).movedim(-1, 1)
+        hint = resize_tensor(hint, tile_size[::-1])
+        controlnet.cond_hint_original = hint
+        c = c.previous_controlnet
+        controlnet.set_previous_controlnet(c.copy() if c is not None else None)
+        controlnet = controlnet.previous_controlnet
+
+def crop_gligen(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad):
+    """
+    Crop GLIGEN conditioning to match the current region.
+    
+    Args:
+        cond_dict: Conditioning dictionary
+        region: Tuple (x1, y1, x2, y2) defining the crop region
+        init_size: Original image size
+        canvas_size: Size of the canvas
+        tile_size: Size of the tile
+        w_pad: Width padding
+        h_pad: Height padding
+    """
+    if "gligen" not in cond_dict:
+        return
+    type, model, cond = cond_dict["gligen"]
+    if type != "position":
+        from warnings import warn
+        warn(f"Unknown gligen type {type}")
+        return
+    cropped = []
+    for c in cond:
+        emb, h, w, y, x = c
+        # Get the coordinates of the box in the upscaled image
+        x1 = x * 8
+        y1 = y * 8
+        x2 = x1 + w * 8
+        y2 = y1 + h * 8
+        gligen_upscaled_box = resize_region((x1, y1, x2, y2), init_size, canvas_size)
+
+        # Calculate the intersection of the gligen box and the region
+        intersection = region_intersection(gligen_upscaled_box, region)
+        if intersection is None:
+            continue
+        x1, y1, x2, y2 = intersection
+
+        # Offset the gligen box so that the origin is at the top left of the tile region
+        x1 -= region[0]
+        y1 -= region[1]
+        x2 -= region[0]
+        y2 -= region[1]
+
+        # Add the padding
+        x1 += w_pad
+        y1 += h_pad
+        x2 += w_pad
+        y2 += h_pad
+
+        # Set the new position params
+        h = (y2 - y1) // 8
+        w = (x2 - x1) // 8
+        x = x1 // 8
+        y = y1 // 8
+        cropped.append((emb, h, w, y, x))
+
+    cond_dict["gligen"] = (type, model, cropped)
+
+def crop_area(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad):
+    """
+    Crop area conditioning to match the current region.
+    
+    Args:
+        cond_dict: Conditioning dictionary
+        region: Tuple (x1, y1, x2, y2) defining the crop region
+        init_size: Original image size
+        canvas_size: Size of the canvas
+        tile_size: Size of the tile
+        w_pad: Width padding
+        h_pad: Height padding
+    """
+    if "area" not in cond_dict:
+        return
+
+    # Resize the area conditioning to the canvas size and confine it to the tile region
+    h, w, y, x = cond_dict["area"]
+    w, h, x, y = 8 * w, 8 * h, 8 * x, 8 * y
+    x1, y1, x2, y2 = resize_region((x, y, x + w, y + h), init_size, canvas_size)
+    intersection = region_intersection((x1, y1, x2, y2), region)
+    if intersection is None:
+        del cond_dict["area"]
+        del cond_dict["strength"]
+        return
+    x1, y1, x2, y2 = intersection
+
+    # Offset origin to the top left of the tile
+    x1 -= region[0]
+    y1 -= region[1]
+    x2 -= region[0]
+    y2 -= region[1]
+
+    # Add the padding
+    x1 += w_pad
+    y1 += h_pad
+    x2 += w_pad
+    y2 += h_pad
+
+    # Set the params for tile
+    w, h = (x2 - x1) // 8, (y2 - y1) // 8
+    x, y = x1 // 8, y1 // 8
+
+    cond_dict["area"] = (h, w, y, x)
+
+def crop_mask(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad):
+    """
+    Crop mask conditioning to match the current region.
+    
+    Args:
+        cond_dict: Conditioning dictionary
+        region: Tuple (x1, y1, x2, y2) defining the crop region
+        init_size: Original image size
+        canvas_size: Size of the canvas
+        tile_size: Size of the tile
+        w_pad: Width padding
+        h_pad: Height padding
+    """
+    if "mask" not in cond_dict:
+        return
+    mask_tensor = cond_dict["mask"]  # (B, H, W)
+    masks = []
+    for i in range(mask_tensor.shape[0]):
+        # Convert to PIL image
+        mask = tensor_to_pil(mask_tensor, i)  # W x H
+
+        # Resize the mask to the canvas size
+        mask = mask.resize(canvas_size, Image.Resampling.BICUBIC)
+
+        # Crop the mask to the region
+        mask = mask.crop(region)
+
+        # Add padding
+        mask, _ = resize_and_pad_image(mask, tile_size[0], tile_size[1], fill=True)
+
+        # Resize the mask to the tile size
+        if tile_size != mask.size:
+            mask = mask.resize(tile_size, Image.Resampling.BICUBIC)
+
+        # Convert back to tensor
+        mask = pil_to_tensor(mask)  # (1, H, W, 1)
+        mask = mask.squeeze(-1)  # (1, H, W)
+        masks.append(mask)
+
+    cond_dict["mask"] = torch.cat(masks, dim=0)  # (B, H, W)
+
+def crop_cond(cond, region, init_size, canvas_size, tile_size, w_pad=0, h_pad=0):
+    """
+    Crop all conditioning information to match the current region.
+    
+    Args:
+        cond: List of conditioning tensors and dictionaries
+        region: Tuple (x1, y1, x2, y2) defining the crop region
+        init_size: Original image size
+        canvas_size: Size of the canvas
+        tile_size: Size of the tile
+        w_pad: Width padding
+        h_pad: Height padding
+        
+    Returns:
+        Cropped conditioning information
+    """
+    cropped = []
+    for emb, x in cond:
+        cond_dict = x.copy()
+        n = [emb, cond_dict]
+        crop_controlnet(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad)
+        crop_gligen(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad)
+        crop_area(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad)
+        crop_mask(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad)
+        cropped.append(n)
+    return cropped
+#######################################################
+# SECTION 5: OBJECT DETECTION AND SEGMENTATION
+#######################################################
+
+# Embedding SimpleDetectorForEach functionality directly in this node
+class SimpleDetectorForEach:
+    """
+    Class providing detection and segmentation functionality.
+    This embedded implementation avoids external dependencies on impact.detectors
+    """
+    
+    @classmethod
+    def detect(cls, detector, image, threshold, dilation, crop_factor, drop_size, 
+               crop_min_size=0, crop_square=False, detailer_hook=None, bbox_fill=0.5, segment_threshold=0.5,
+               sam_model_opt=None, segm_detector_opt=None):
+        """
+        Run detection on an image.
+        
+        Args:
+            detector: Bbox detector model
+            image: Image tensor
+            threshold: Detection confidence threshold
+            dilation: Amount to dilate detected regions
+            crop_factor: Factor for cropping
+            drop_size: Minimum size to keep
+            crop_min_size: Minimum crop size
+            crop_square: Whether to make crops square
+            detailer_hook: Hook for detailed detection
+            bbox_fill: Bounding box fill factor
+            segment_threshold: Segmentation threshold
+            sam_model_opt: Optional SAM model for segmentation
+            segm_detector_opt: Optional segmentation detector
+            
+        Returns:
+            SEGS object with detection results
+        """
+        # Run basic detection
+        segs = detector.detect(image, threshold, dilation, crop_factor, drop_size, 
+                             crop_min_size, crop_square, detailer_hook, bbox_fill)
+                             
+        # Run segmentation refinement if available
+        if segm_detector_opt is not None and sam_model_opt is not None:
+            refined_segs = cls.segment_refined(segs, sam_model_opt, segm_detector_opt, segment_threshold)
+            return refined_segs
+        
+        return segs
+    
+    @classmethod
+    def segment_refined(cls, segs, sam_model, segm_detector, threshold):
+        """
+        Refine detections with segmentation.
+        
+        Args:
+            segs: SEGS object with bounding box detections
+            sam_model: SAM model for segmentation
+            segm_detector: Segmentation detector
+            threshold: Segmentation threshold
+            
+        Returns:
+            Refined SEGS object with segmentation
+        """
+        # Basic segmentation refinement logic
+        # This is a simplified version of what would be in the impact.detectors module
+        if segs is None or segs[1] is None or len(segs[1]) == 0:
+            return segs
+            
+        try:
+            # Use the segmentation detector to refine the bounding boxes
+            refined_segs = segm_detector.detect(segs, sam_model=sam_model, threshold=threshold)
+            return refined_segs
+        except Exception as e:
+            print(f"[USDU] Segmentation refinement error: {e}")
+            return segs
+#######################################################
+# SECTION 6: DATA MODELS AND SHARED STATE
+#######################################################
+
+# Shared module implementation
+class Options:
+    """Class representing global options."""
+    img2img_background_color = "#ffffff"  # Set to white for now
+
+class State:
+    """Class for tracking global state."""
+    interrupted = False
+
+    def begin(self):
+        """Begin processing."""
+        pass
+
+    def end(self):
+        """End processing."""
+        pass
+
+# Global variables (equivalent to shared.py)
+opts = Options()
+state = State()
+sd_upscalers = [None]  # Will only ever hold the one upscaler
+actual_upscaler = None  # The upscaler usable by ComfyUI nodes
+batch = None  # Batch of images to upscale
+
+# Upscaler implementation
+class Upscaler:
+    """Class providing upscaling functionality."""
+    
+    def _upscale(self, img: Image, scale):
+        """
+        Internal upscale method.
+        
+        Args:
+            img: PIL image to upscale
+            scale: Scale factor
+        
+        Returns:
+            Upscaled PIL image
+        """
         if scale == 1.0:
             return img
-        if self.upscaler_model is None:
-            return img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS)
-        
+        if (actual_upscaler is None):
+            return img.resize((round(img.width * scale), round(img.height * scale)), Image.Resampling.LANCZOS)
         tensor = pil_to_tensor(img)
+        from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
         image_upscale_node = ImageUpscaleWithModel()
-        (upscaled,) = image_upscale_node.upscale(self.upscaler_model, tensor)
+        (upscaled,) = image_upscale_node.upscale(actual_upscaler, tensor)
         return tensor_to_pil(upscaled)
-    
-    def upscale(self, img, scale):
-        return self._upscale(img, scale)
 
-class VAEEncode:
-    """Wrapper for VAE encoding"""
-    def encode(self, vae, image_tensor):
-        return (vae.encode(image_tensor),)
+    def upscale(self, img: Image, scale, selected_model: str = None):
+        """
+        Upscale all images in the batch.
+        
+        Args:
+            img: PIL image (first in batch)
+            scale: Scale factor
+            selected_model: Optionally select a specific model
+            
+        Returns:
+            First upscaled image
+        """
+        global batch
+        batch = [self._upscale(img, scale) for img in batch]
+        return batch[0]
 
-class VAEDecode:
-    """Wrapper for VAE decoding"""
-    def decode(self, vae, latent):
-        return (vae.decode(latent),)
+class UpscalerData:
+    """Wrapper for upscaler data."""
+    name = ""
+    data_path = ""
 
-class VAEDecodeTiled:
-    """Wrapper for tiled VAE decoding"""
-    def decode(self, vae, samples, tile_size=512):
-        if hasattr(vae, 'decode_tiled'):
-            return (vae.decode_tiled(samples, tile_size),)
-        print("[USDU] Tiled decode not available in VAE, falling back to regular decode")
-        return (vae.decode(samples),)
+    def __init__(self):
+        """Initialize with an Upscaler instance."""
+        self.scaler = Upscaler()
+#######################################################
+# SECTION 7: PROCESSING CORE
+#######################################################
 
-def sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise, custom_sampler=None, custom_sigmas=None):
-    """Sample from the model with the given parameters"""
-    # Custom sampler and sigmas
-    if custom_sampler is not None and custom_sigmas is not None:
-        custom_sample = SamplerCustom()
-        (samples, _) = getattr(custom_sample, custom_sample.FUNCTION)(
-            model=model,
-            add_noise=True,
-            noise_seed=seed,
-            cfg=cfg,
-            positive=positive,
-            negative=negative,
-            sampler=custom_sampler,
-            sigmas=custom_sigmas,
-            latent_image=latent
-        )
-        return samples
-    
-    # Default KSampler
-    sampler = KSampler()
-    (samples,) = sampler.sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=denoise)
-    return samples
-
+# StableDiffusionProcessing implementation
 class StableDiffusionProcessing:
-    """Main processing class for UltimateSDUpscaler"""
+    """
+    Core processing class for Stable Diffusion upscaling operations.
+    """
     def __init__(
         self,
         init_img,
@@ -371,13 +862,9 @@ class StableDiffusionProcessing:
         tile_height,
         redraw_mode,
         seam_fix_mode,
-        batch=None,
         custom_sampler=None,
         custom_sigmas=None,
     ):
-        # Initialize batch
-        self.batch = batch if batch is not None else [init_img]
-        
         # Variables used by the USDU script
         self.init_images = [init_img]
         self.image_mask = None
@@ -399,6 +886,7 @@ class StableDiffusionProcessing:
         self.sampler_name = sampler_name
         self.scheduler = scheduler
         self.denoise = denoise
+        self.upscale_by = upscale_by
 
         # Optional custom sampler and sigmas
         self.custom_sampler = custom_sampler
@@ -409,15 +897,13 @@ class StableDiffusionProcessing:
 
         # Variables used only by this script
         self.init_size = init_img.width, init_img.height
-        self.upscale_by = upscale_by
         self.uniform_tile_mode = uniform_tile_mode
         self.tiled_decode = tiled_decode
-        self.tile_width = tile_width
-        self.tile_height = tile_height
         
-        # Create VAE encoder and decoder nodes
-        self.vae_encoder = VAEEncode()
+        # Import here to avoid circular imports
+        from nodes import VAEEncode, VAEDecode, VAEDecodeTiled
         self.vae_decoder = VAEDecode()
+        self.vae_encoder = VAEEncode()
         self.vae_decoder_tiled = VAEDecodeTiled()
 
         if self.tiled_decode:
@@ -427,18 +913,20 @@ class StableDiffusionProcessing:
         self.extra_generation_params = {}
 
         # Load config file for USDU
-        self.config_path = os.path.join(os.path.dirname(__file__), 'usdu_config.json')
-        self.config = {}
-        if os.path.exists(self.config_path):
-            with open(self.config_path, 'r') as f:
-                self.config = json.load(f)
+        import os
+        import json
+        config_path = os.path.join(os.path.dirname(__file__), os.pardir, 'config.json')
+        config = {}
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
 
         # Progress bar for the entire process instead of per tile
         self.progress_bar_enabled = False
-        if hasattr(comfy.utils, 'PROGRESS_BAR_ENABLED') and comfy.utils.PROGRESS_BAR_ENABLED:
+        import comfy
+        if comfy.utils.PROGRESS_BAR_ENABLED:
             self.progress_bar_enabled = True
-            self.per_tile_progress = self.config.get('per_tile_progress', True)
-            comfy.utils.PROGRESS_BAR_ENABLED = self.per_tile_progress
+            comfy.utils.PROGRESS_BAR_ENABLED = config.get('per_tile_progress', True)
             self.tiles = 0
             if redraw_mode.value != USDUMode.NONE.value:
                 self.tiles += self.rows * self.cols
@@ -449,32 +937,94 @@ class StableDiffusionProcessing:
             elif seam_fix_mode.value == USDUSFMode.HALF_TILE_PLUS_INTERSECTIONS.value:
                 self.tiles += (self.rows - 1) * self.cols + (self.cols - 1) * self.rows + (self.rows - 1) * (self.cols - 1)
             self.pbar = None
-            self.redraw_mode = redraw_mode
-            self.seam_fix_mode = seam_fix_mode
+            # Creating the pbar here would cause an empty progress bar to be displayed
 
     def __del__(self):
+        """Clean up when the object is destroyed."""
         # Undo changes to progress bar flag when node is done or cancelled
-        if self.progress_bar_enabled and hasattr(comfy.utils, 'PROGRESS_BAR_ENABLED'):
+        import comfy
+        if self.progress_bar_enabled:
             comfy.utils.PROGRESS_BAR_ENABLED = True
 
 class Processed:
-    """Result container for USDU processing"""
-    def __init__(self, p, images, seed, info):
+    """
+    Class to hold processed results.
+    """
+    def __init__(self, p: StableDiffusionProcessing, images: list, seed: int, info: str):
         self.images = images
         self.seed = seed
         self.info = info
 
-    def infotext(self, p, index):
+    def infotext(self, p: StableDiffusionProcessing, index):
+        """Get info text for a processed image."""
         return None
 
-def process_images(p):
-    """Main processing function for USDU"""
+def sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise, custom_sampler, custom_sigmas):
+    """
+    Generate samples using the specified sampler and parameters.
+    
+    Args:
+        model: Stable Diffusion model
+        seed: Random seed
+        steps: Number of sampling steps
+        cfg: Classifier-free guidance scale
+        sampler_name: Name of sampler to use
+        scheduler: Scheduler to use
+        positive: Positive conditioning
+        negative: Negative conditioning
+        latent: Latent input image
+        denoise: Denoising strength
+        custom_sampler: Optional custom sampler
+        custom_sigmas: Optional custom sigmas
+        
+    Returns:
+        Generated samples
+    """
+    # Choose way to sample based on given inputs
+
+    # Custom sampler and sigmas
+    if custom_sampler is not None and custom_sigmas is not None:
+        from comfy_extras.nodes_custom_sampler import SamplerCustom
+        custom_sample = SamplerCustom()
+        (samples, _) = getattr(custom_sample, custom_sample.FUNCTION)(
+            model=model,
+            add_noise=True,
+            noise_seed=seed,
+            cfg=cfg,
+            positive=positive,
+            negative=negative,
+            sampler=custom_sampler,
+            sigmas=custom_sigmas,
+            latent_image=latent
+        )
+        return samples
+
+    # Default
+    from nodes import common_ksampler
+    (samples,) = common_ksampler(model, seed, steps, cfg, sampler_name,
+                               scheduler, positive, negative, latent, denoise=denoise)
+    return samples
+
+def process_images(p: StableDiffusionProcessing) -> Processed:
+    """
+    Main image generation function.
+    
+    Args:
+        p: StableDiffusionProcessing object with all parameters
+        
+    Returns:
+        Processed object with results
+    """
     # Show the progress bar
+    from tqdm import tqdm
     if p.progress_bar_enabled and p.pbar is None:
         p.pbar = tqdm(total=p.tiles, desc='USDU', unit='tile')
 
     # Setup
-    image_mask = p.image_mask.convert('L') if p.image_mask is not None else Image.new('L', p.init_images[0].size, 255)
+    # Create a full white mask for each image if not provided
+    if p.image_mask is None:
+        p.image_mask = Image.new('L', (p.init_images[0].width, p.init_images[0].height), 255)
+    image_mask = p.image_mask.convert('L')
     init_image = p.init_images[0]
 
     # Locate the white region of the mask outlining the tile and add padding
@@ -496,21 +1046,23 @@ def process_images(p):
         crop_region, _ = expand_crop(crop_region, image_mask.width, image_mask.height, target_width, target_height)
         tile_size = p.width, p.height
     else:
-        # Uses the minimal size that can fit the mask, minimizes tile size but may lead to image sizes that the model is not trained on
+        # Uses the minimal size that can fit the mask
         x1, y1, x2, y2 = crop_region
         crop_width = x2 - x1
         crop_height = y2 - y1
         target_width = math.ceil(crop_width / 8) * 8
         target_height = math.ceil(crop_height / 8) * 8
         crop_region, tile_size = expand_crop(crop_region, image_mask.width,
-                                         image_mask.height, target_width, target_height)
+                                           image_mask.height, target_width, target_height)
 
     # Blur the mask
     if p.mask_blur > 0:
+        from PIL import ImageFilter
         image_mask = image_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
 
     # Crop the images to get the tiles that will be used for generation
-    tiles = [img.crop(crop_region) for img in p.batch]
+    global batch
+    tiles = [img.crop(crop_region) for img in batch]
 
     # Assume the same size for all images in the batch
     initial_tile_size = tiles[0].size
@@ -533,7 +1085,7 @@ def process_images(p):
                    negative_cropped, latent, p.denoise, p.custom_sampler, p.custom_sigmas)
 
     # Update the progress bar
-    if p.progress_bar_enabled and p.pbar is not None:
+    if p.progress_bar_enabled:
         p.pbar.update(1)
 
     # Decode the sample
@@ -545,9 +1097,8 @@ def process_images(p):
     # Convert the sample to a PIL image
     tiles_sampled = [tensor_to_pil(decoded, i) for i in range(len(decoded))]
 
-    result_images = []
     for i, tile_sampled in enumerate(tiles_sampled):
-        init_image = p.batch[i]
+        init_image = batch[i]
 
         # Resize back to the original size
         if tile_sampled.size != initial_tile_size:
@@ -558,7 +1109,6 @@ def process_images(p):
         image_tile_only.paste(tile_sampled, crop_region[:2])
 
         # Add the mask as an alpha channel
-        # Must make a copy due to the possibility of an edge becoming black
         temp = image_tile_only.copy()
         temp.putalpha(image_mask)
         image_tile_only.paste(temp, image_tile_only)
@@ -569,1114 +1119,527 @@ def process_images(p):
 
         # Convert back to RGB
         result = result.convert('RGB')
-        result_images.append(result)
 
-    return Processed(p, result_images, p.seed, None)
+        batch[i] = result
 
-def process_with_model(
-    image: torch.Tensor,
-    upscale_model: Any = None,
-    target_size: int = 1024,
-    scale_factor: float = 1.0,
-    divisibility: int = 64,
-    tile_size: int = 512,
-    overlap: int = 64,
-    model = None,
-    vae = None,
-    positive = None,
-    negative = None,
-    seed: int = 0,
-    steps: int = 20,
-    cfg: float = 8.0,
-    sampler_name: str = "euler",
-    scheduler: str = "normal",
-    denoise: float = 0.5,
-    mask_blur: int = 4,
-    mask_dilation: int = 0
-) -> torch.Tensor:
+    processed = Processed(p, [batch[0]], p.seed, None)
+    return processed
+
+# USDU script stub - replaced by the actual implementation when running
+class Script:
     """
-    Process image with model-based scaling using the UltimateSDUpscaler approach.
-    For large images, uses tiled downscaling with Lanczos followed by model refinement.
+    Script class that serves as an adapter to the USDU script.
     """
-    print(f"Processing with model (target size: {target_size}, scale: {scale_factor}x)")
-    
-    # Ensure image is in BHWC format with basic error handling
-    if image is None or image.numel() == 0:
-        print("Empty input image")
-        return None
-        
-    # Basic shape verification and conversion
-    if len(image.shape) == 3:  # HWC
-        image = image.unsqueeze(0)  # Add batch dimension
-    elif len(image.shape) == 4 and image.shape[1] <= 4 and image.shape[2] > 4 and image.shape[3] > 4:
-        # BCHW format, convert to BHWC
-        image = image.permute(0, 2, 3, 1)
-    
-    # Verify image shape after conversion
-    if len(image.shape) != 4:
-        print(f"Unexpected image shape after conversion: {image.shape}")
-        return None
-    
-    # Extract dimensions
-    batch_size, height, width, channels = image.shape
-    print(f"Input image: {width}x{height}x{channels} (batch size: {batch_size})")
-    
-    # Calculate scale to match target size for longest edge
-    longest_edge = max(width, height)
-    base_scale = target_size / longest_edge
-    
-    # Calculate initial target size (bucket size)
-    initial_target_w = int(width * base_scale)
-    initial_target_h = int(height * base_scale)
-    
-    # Ensure divisibility for initial target
-    initial_target_w = get_nearest_divisible_size(initial_target_w, divisibility)
-    initial_target_h = get_nearest_divisible_size(initial_target_h, divisibility)
-    
-    print(f"Initial target dimensions: {initial_target_w}x{initial_target_h} (bucket size)")
-    
-    # Calculate final target size with scale factor
-    final_target_w = int(initial_target_w * scale_factor)
-    final_target_h = int(initial_target_h * scale_factor)
-    
-    # Ensure divisibility for final dimensions
-    final_target_w = get_nearest_divisible_size(final_target_w, divisibility)
-    final_target_h = get_nearest_divisible_size(final_target_h, divisibility)
-    
-    print(f"Final target dimensions with scale_factor {scale_factor}x: {final_target_w}x{final_target_h}")
-    
-    # Process each image in the batch
-    result_tensors = []
-    
-    for b in range(batch_size):
+    def run(self, p, _, **kwargs):
+        """Run the script either using the original USDU or the fallback."""
+        # Import the actual USDU implementation
         try:
-            # Extract single image from batch
-            img_bhwc = image[b:b+1]
-            
-            # Record the device of the input image
-            device = img_bhwc.device
-            print(f"Processing on device: {device}")
-            
-            # Special checking for unusual tensor shapes
-            if img_bhwc.shape[1] == 1 and img_bhwc.shape[2] == 1 and img_bhwc.shape[3] > 4:
-                print(f"Detected unusual tensor shape: {img_bhwc.shape}, skipping")
-                continue
-            
-            # Always use tiled processing for large images
-            print(f"Using tiled downscaling to bucket size {initial_target_w}x{initial_target_h} followed by model-based upscaling")
-            
-            # Step 1: Create initial downscaled image using tiled Lanczos
-            # Initialize empty tensor for downscaled image - ENSURE CORRECT DEVICE
-            downscaled = torch.zeros((1, initial_target_h, initial_target_w, channels), 
-                                   dtype=torch.float32, 
-                                   device=device)  # Use the same device as input
-            
-            # REVISED APPROACH: Simplify tiling strategy to eliminate black grid
-            # Calculate optimal non-overlapping tiles
-            effective_tile_size = min(1024, tile_size)  # Limit tile size for memory
-            
-            # Use a much simpler tiling approach without overlaps for the main content
-            tiles_x = math.ceil(width / effective_tile_size)
-            tiles_y = math.ceil(height / effective_tile_size)
-            
-            print(f"Downscaling with LANCZOS in {tiles_x}x{tiles_y} tiles (non-overlapping)")
-            
-            # Process each tile for downscaling without complex feathering
-            for y in range(tiles_y):
-                for x in range(tiles_x):
-                    # Calculate tile coordinates (non-overlapping)
-                    x1 = x * effective_tile_size
-                    y1 = y * effective_tile_size
-                    x2 = min(width, (x + 1) * effective_tile_size)
-                    y2 = min(height, (y + 1) * effective_tile_size)
-                    
-                    # Calculate output coordinates for this tile
-                    out_x1 = int(x1 * base_scale)
-                    out_y1 = int(y1 * base_scale)
-                    out_x2 = int(x2 * base_scale)
-                    out_y2 = int(y2 * base_scale)
-                    
-                    # Ensure we don't exceed target dimensions
-                    out_x2 = min(initial_target_w, out_x2)
-                    out_y2 = min(initial_target_h, out_y2)
-                    
-                    # Skip tiny tiles
-                    if out_x2 - out_x1 < 8 or out_y2 - out_y1 < 8:
-                        continue
-                    
-                    print(f"Processing tile ({x},{y}): {x2-x1}x{y2-y1} → {out_x2-out_x1}x{out_y2-out_y1}")
-                    
-                    # Extract tile
-                    tile = img_bhwc[:, y1:y2, x1:x2, :]
-                    
-                    # Convert to PIL for high-quality Lanczos
-                    tile_np = tile[0].cpu().numpy()
-                    if tile_np.max() <= 1.0:
-                        tile_np = (tile_np * 255).astype(np.uint8)
-                    else:
-                        tile_np = tile_np.astype(np.uint8)
-                    tile_pil = Image.fromarray(tile_np)
-                    
-                    # Downscale with Lanczos
-                    downscaled_tile = tile_pil.resize((out_x2 - out_x1, out_y2 - out_y1), 
-                                                   Image.Resampling.LANCZOS)
-                    
-                    # Convert back to tensor
-                    downscaled_np = np.array(downscaled_tile).astype(np.float32) / 255.0
-                    # Ensure correct channel ordering and shape
-                    if len(downscaled_np.shape) == 2:  # Grayscale image
-                        print(f"Converting grayscale tile to RGB...")
-                        downscaled_np = np.stack([downscaled_np] * 3, axis=-1)
-                    elif len(downscaled_np.shape) == 3 and downscaled_np.shape[2] == 4:  # RGBA image
-                        print(f"Converting RGBA tile to RGB...")
-                        downscaled_np = downscaled_np[:,:,:3]  # Keep only RGB channels
-                    elif len(downscaled_np.shape) == 3 and downscaled_np.shape[2] != 3:
-                        print(f"WARNING: Unexpected channel count in tile: {downscaled_np.shape}")
-                        # Try to correct unusual channel counts
-                        if downscaled_np.shape[2] == 1:  # Single channel
-                            downscaled_np = np.concatenate([downscaled_np] * 3, axis=2)
-                        elif downscaled_np.shape[2] > 4:  # Too many channels
-                            downscaled_np = downscaled_np[:,:,:3]  # Try to use first 3 channels
-                    
-                    # Now create tensor (should be [H,W,3] at this point)
-                    downscaled_tile_tensor = torch.from_numpy(downscaled_np).unsqueeze(0)
-                    
-                    # Move tensor to the correct device
-                    downscaled_tile_tensor = downscaled_tile_tensor.to(device)
-                    
-                    # Direct copy without blending to avoid black grid artifacts
-                    try:
-                        # Simple placement without feathering
-                        h = min(downscaled.shape[1]-out_y1, downscaled_tile_tensor.shape[1])
-                        w = min(downscaled.shape[2]-out_x1, downscaled_tile_tensor.shape[2])
-                        
-                        if h <= 0 or w <= 0:
-                            print(f"Warning: Invalid tile dimensions (h={h}, w={w}), skipping")
-                            continue
-                            
-                        downscaled[:, out_y1:out_y1+h, out_x1:out_x1+w, :] = \
-                            downscaled_tile_tensor[:, :h, :w, :]
-                    except Exception as e:
-                        print(f"Error in tile placement: {e}")
-            
-            # Step 2: Convert initial downscaled tensor to PIL for model processing
-            downscaled_np = downscaled[0].cpu().numpy()
-            
-            # Fix: Ensure no black areas by checking and filling if needed
-            black_mask = (downscaled_np == 0).all(axis=-1)
-            if black_mask.any():
-                print(f"Warning: Detected {black_mask.sum()} black pixels in the downscaled image")
-                # Fill black areas with nearest non-black pixels (simple repair)
-                from scipy import ndimage
-                
-                # Only attempt repair if we have some non-black pixels
-                if not black_mask.all():
-                    for c in range(downscaled_np.shape[-1]):
-                        channel = downscaled_np[..., c]
-                        # Create a mask where the channel is black
-                        mask = (channel == 0)
-                        # Only fix pixels that are black in all channels
-                        mask = mask & black_mask
-                        # Use nearest neighbor interpolation to fill black areas
-                        if mask.any():
-                            channel[mask] = ndimage.grey_dilation(channel, size=(3, 3))[mask]
-                            # If some pixels are still black, use a larger kernel
-                            mask = (channel == 0) & black_mask
-                            if mask.any():
-                                channel[mask] = ndimage.grey_dilation(channel, size=(5, 5))[mask]
-            
-            # Convert to PIL image
-            if downscaled_np.max() <= 1.0:
-                downscaled_np = (downscaled_np * 255).astype(np.uint8)
-            else:
-                downscaled_np = downscaled_np.astype(np.uint8)
-            
-            # EXTENSIVE DIAGNOSTIC OUTPUT ----
-            print("\n----- EXTENSIVE TENSOR DIAGNOSTIC -----")
-            print(f"downscaled_np shape: {downscaled_np.shape}")
-            print(f"downscaled_np dtype: {downscaled_np.dtype}")
-            print(f"downscaled_np min: {downscaled_np.min()}, max: {downscaled_np.max()}")
-            
-            # Check tensor dimensions and structure
-            print(f"Tensor rank: {len(downscaled_np.shape)}")
-            
-            # Check for NaN or inf values
-            has_nan = np.isnan(downscaled_np).any()
-            has_inf = np.isinf(downscaled_np).any()
-            print(f"Contains NaN: {has_nan}, Contains Inf: {has_inf}")
-            
-            # Check channel dimension and arrangement
-            if len(downscaled_np.shape) == 3:
-                h, w, c = downscaled_np.shape
-                print(f"Height: {h}, Width: {w}, Channels: {c}")
-                
-                # Verify if channels are in expected order (should be 3 or 4)
-                if c not in [1, 3, 4]:
-                    print(f"WARNING: Unexpected number of channels: {c}")
-                    print("This may indicate dimension ordering problems")
-                    # Try to investigate further
-                    print(f"First pixel values: {downscaled_np[0,0,:]}")
-                    
-                    # If c > 4, we might have a transposed tensor
-                    if c > 4:
-                        print("CRITICAL ERROR: Channel dimension appears to be transposed!")
-                        print("Attempting to fix the transposition...")
-                        
-                        # Try to identify if we have a NCHW instead of NHWC format
-                        if h <= 4 and w > 4 and c > 16:
-                            print(f"Tensor appears to be in wrong format. Reshaping from {downscaled_np.shape}")
-                            try:
-                                # Reshape based on total size
-                                total_size = downscaled_np.size
-                                ideal_h = int(math.sqrt(total_size // 3))
-                                ideal_w = ideal_h
-                                while ideal_h * ideal_w * 3 < total_size:
-                                    ideal_w += 1
-                                
-                                # Create a temporary tensor with correct shape
-                                print(f"Attempting to reshape to approximately {ideal_h}x{ideal_w}x3")
-                                
-                                # This is a drastic measure, but if dimensions are completely wrong
-                                # let's try to transpose them
-                                if h == 1:
-                                    print("Detected possible flattened format, attempting fix...")
-                                    # Try different strategies
-                                    if w == 3 and c % 2 == 0:  # Might be in format [1, 3, HW]
-                                        square_side = int(math.sqrt(c))
-                                        if square_side * square_side == c:
-                                            corrected = downscaled_np.reshape(square_side, square_side, 3)
-                                            print(f"Reshaped to {corrected.shape}")
-                                            downscaled_np = corrected
-                                    else:
-                                        # Try a more aggressive reshape
-                                        try:
-                                            # Calculate dimensions that would give us 3 channels
-                                            total_elements = downscaled_np.size
-                                            h_estimate = int(math.sqrt(total_elements / 3))
-                                            w_estimate = h_estimate
-                                            # Adjust w to account for any remainder
-                                            while h_estimate * w_estimate * 3 < total_elements:
-                                                w_estimate += 1
-                                            
-                                            # Reshape - this is risky but might salvage the situation
-                                            print(f"Attempting emergency reshape to {h_estimate}x{w_estimate}x3")
-                                            downscaled_np = downscaled_np.reshape(h_estimate, w_estimate, 3)
-                                        except Exception as reshape_err:
-                                            print(f"Emergency reshape failed: {reshape_err}")
-                            except Exception as e:
-                                print(f"Reshape attempt failed: {e}")
-            else:
-                print(f"WARNING: Unexpected tensor rank: {len(downscaled_np.shape)}")
-            
-            # Histogram of values to check distribution
-            if not has_nan and not has_inf:
-                try:
-                    hist, bins = np.histogram(downscaled_np.flatten(), bins=10)
-                    print("Value distribution (histogram):")
-                    for i in range(len(hist)):
-                        print(f"  {bins[i]:.2f}-{bins[i+1]:.2f}: {hist[i]}")
-                except Exception as hist_err:
-                    print(f"Couldn't generate histogram: {hist_err}")
-            
-            # Check if image can be created from this tensor
-            try:
-                print("Attempting to create PIL image...")
-                test_image = Image.fromarray(downscaled_np)
-                print(f"Success! PIL image created with size: {test_image.size} and mode: {test_image.mode}")
-                # Save the actual image
-                downscaled_pil = test_image
-            except Exception as pil_err:
-                print(f"CRITICAL ERROR: Cannot create PIL image: {pil_err}")
-                print("This indicates serious tensor incompatibility")
-                
-                # Last resort correction attempts
-                print("Attempting emergency corrections...")
-                
-                try:
-                    # Try typical fixes for PIL conversion issues
-                    if downscaled_np.dtype != np.uint8:
-                        print("Converting to uint8...")
-                        downscaled_np = downscaled_np.astype(np.uint8)
-                    
-                    # Check if all values are the same (might be a blank tensor)
-                    all_same = (downscaled_np == downscaled_np.flat[0]).all()
-                    if all_same:
-                        print("WARNING: Tensor contains all identical values")
-                    
-                    # If we have a 2D tensor, try to expand to 3D with RGB
-                    if len(downscaled_np.shape) == 2:
-                        print("Expanding 2D tensor to RGB...")
-                        downscaled_np = np.stack([downscaled_np] * 3, axis=-1)
-                    
-                    # Try again with the fixed tensor
-                    downscaled_pil = Image.fromarray(downscaled_np)
-                    print(f"Emergency fix successful. Created PIL image with size: {downscaled_pil.size}")
-                    
-                except Exception as e:
-                    print(f"Emergency fixes failed: {e}")
-                    print("Creating blank image as last resort")
-                    # Create a blank image rather than failing
-                    downscaled_pil = Image.new('RGB', (initial_target_w, initial_target_h), color=(128, 128, 128))
-            
-            print("----- END DIAGNOSTIC -----\n")
-            # END DIAGNOSTIC OUTPUT ----
-            
-            print(f"Successfully created downscaled PIL image at bucket size: {downscaled_pil.size} using LANCZOS")
-            
-            print(f"Applying models for refinement and scaling together (scale factor: {scale_factor}x)")
-            
-            # Create mask for full image
-            mask = Image.new('L', downscaled_pil.size, 255)
-            
-            # Additional diagnostic right before passing to StableDiffusionProcessing
-            print("\n----- FINAL IMAGE CHECK BEFORE PROCESSING -----")
-            print(f"PIL Image size: {downscaled_pil.size}")
-            print(f"PIL Image mode: {downscaled_pil.mode}")
-            print(f"Mask size: {mask.size}")
-            print(f"Mask mode: {mask.mode}")
-            print("----- END FINAL CHECK -----\n")
-            
-            # Set up processing with both enhancement and scaling in one step
-            p = StableDiffusionProcessing(
-                init_img=downscaled_pil,
-                model=model,
-                positive=positive,
-                negative=negative if negative is not None else model.get_empty_conditioning(),
-                vae=vae,
-                seed=seed,
-                steps=steps,
-                cfg=cfg,
-                sampler_name=sampler_name,
-                scheduler=scheduler,
-                denoise=denoise,
-                upscale_by=scale_factor,  # Apply the scale factor here
-                uniform_tile_mode=True,
-                tiled_decode=True,
-                tile_width=min(512, initial_target_w),
-                tile_height=min(512, initial_target_h),
-                redraw_mode=USDUMode.LINEAR,
-                seam_fix_mode=USDUSFMode.BAND_PASS,
-                batch=[downscaled_pil]
-            )
-            
-            # Set the mask
-            p.image_mask = mask
-            
-            # Process the image - this will both enhance and scale
-            try:
-                print("Processing with StableDiffusionProcessing...")
-                
-                # CRITICAL DIAGNOSTIC before process_images call
-                print("\n----- CRITICAL PRE-PROCESSING DIAGNOSTIC -----")
-                
-                # Check vae
-                print(f"VAE type: {type(p.vae)}")
-                
-                # Check input image dimensions
-                pil_array = np.array(p.init_images[0])
-                print(f"Input PIL image array shape: {pil_array.shape}")
-                
-                # Validate that channels are in correct order
-                if len(pil_array.shape) == 3:
-                    print(f"Channel dimension: {pil_array.shape[2]}")
-                    if pil_array.shape[2] != 3:
-                        print(f"WARNING: Unexpected channel count {pil_array.shape[2]} - should be 3 for RGB")
-                        
-                        # Try to diagnose and fix the issue
-                        if pil_array.shape[2] > 3:
-                            print(f"Truncating to first 3 channels")
-                            fixed_array = pil_array[:,:,:3]
-                            p.init_images[0] = Image.fromarray(fixed_array.astype(np.uint8))
-                        elif pil_array.shape[2] == 1:
-                            print(f"Expanding single channel to RGB")
-                            fixed_array = np.concatenate([pil_array] * 3, axis=2)
-                            p.init_images[0] = Image.fromarray(fixed_array.astype(np.uint8))
-                else:
-                    print(f"WARNING: Unexpected array shape: {pil_array.shape}")
-                
-                # Check batch
-                print(f"Batch size: {len(p.batch)}")
-                if len(p.batch) > 0:
-                    for i, img in enumerate(p.batch):
-                        print(f"  Batch image {i} size: {img.size}, mode: {img.mode}")
-                
-                # Test VAE encode on a small sample to see if it works
-                try:
-                    print("Testing VAE encode/decode on a small sample...")
-                    # NO NEED TO RESIZE - Test with current dimensions
-                    test_img = p.init_images[0]
-                    
-                    # CRITICAL FIX FOR VAE: Ensure correct tensor format (BCHW)
-                    test_array = np.array(test_img).astype(np.float32) / 255.0
-                    if len(test_array.shape) == 2:  # Grayscale
-                        test_array = np.stack([test_array] * 3, axis=-1)
-                    elif test_array.shape[2] == 4:  # RGBA
-                        test_array = test_array[:, :, :3]  # RGB only
-                    
-                    # Manually create the tensor in correct format (BCHW) with fixed test values
-                    test_tensor = torch.tensor([[[[1.0]]]], dtype=torch.float32)  # Start with minimal tensor
-                    
-                    # Expand to proper size with identifiable fixed values at each dimension
-                    # Values 1, 2, 3, 4 represent batch, channel, height, width dimensions
-                    # Batch = 1
-                    b_size = 1
-                    # Channels = 2 (fixed identifier value, will be expanded to 3 later)
-                    c_size = 2
-                    # Height and width from image (use smaller values for testing if needed)
-                    h_size = min(test_array.shape[0], 16)
-                    w_size = min(test_array.shape[1], 16)
-                    
-                    # Create tensor with identifiable values
-                    test_tensor = torch.ones((b_size, c_size, h_size, w_size), dtype=torch.float32)
-                    
-                    # Set values to represent dimensions
-                    test_tensor.fill_(0.0)  # Start with all zeros
-                    test_tensor[0, :, :, :].fill_(1.0)  # Batch dimension = 1
-                    test_tensor[0, 0, :, :].fill_(2.0)  # First channel = 2
-                    test_tensor[0, 1, :, :].fill_(3.0)  # Second channel = 3
-                    # Add identifiable value to first element of height dimension
-                    if h_size > 0 and w_size > 0:
-                        test_tensor[0, 0, 0, 0] = 4.0
-                    
-                    # Expand to 3 channels (required by VAE)
-                    test_tensor = torch.cat([test_tensor, test_tensor[:,:1]], dim=1)
-                    
-                    print(f"Test tensor manually created with shape: {test_tensor.shape}")
-                    print(f"Test tensor format: [Batch, Channels, Height, Width] = {list(test_tensor.shape)}")
-                    print(f"Test tensor values: Batch={test_tensor[0,0,0,0]}, Channel1={test_tensor[0,0,1,1]}, Channel2={test_tensor[0,1,1,1]}, Channel3={test_tensor[0,2,1,1]}")
-                    
-                    # Try VAE encode with verified BCHW tensor
-                    print("Attempting VAE encode with verified BCHW tensor...")
-                    test_latent = p.vae.encode(test_tensor)
-                    print(f"Test latent shape: {test_latent.shape}")
-                    
-                    # Test decode only if encode succeeded
-                    test_decoded = p.vae.decode(test_latent)
-                    print(f"Test decoded shape: {test_decoded.shape}")
-                    
-                    print("VAE encode/decode test passed!")
-                    
-                    # Apply the test fix to the real processing function
-                    print("Applying working test fix to main process_images function...")
-                    
-                    # CRITICAL: Monkey patch the process_images function to use correct tensor format
-                    original_process_images = process_images
-                    
-                    def patched_process_images(p):
-                        """Patched version that ensures correct tensor formats"""
-                        print("Using patched process_images function with format fixes")
-                        
-                        # Original setup code
-                        if p.progress_bar_enabled and p.pbar is None:
-                            p.pbar = tqdm(total=p.tiles, desc='USDU', unit='tile')
-                            
-                        image_mask = p.image_mask.convert('L') if p.image_mask is not None else Image.new('L', p.init_images[0].size, 255)
-                        init_image = p.init_images[0]
-                        crop_region = get_crop_region(image_mask, p.inpaint_full_res_padding)
-                        
-                        # Rest of original code up to the tensor conversion
-                        if p.uniform_tile_mode:
-                            x1, y1, x2, y2 = crop_region
-                            crop_width = x2 - x1
-                            crop_height = y2 - y1
-                            crop_ratio = crop_width / crop_height
-                            p_ratio = p.width / p.height
-                            if crop_ratio > p_ratio:
-                                target_width = crop_width
-                                target_height = round(crop_width / p_ratio)
-                            else:
-                                target_width = round(crop_height * p_ratio)
-                                target_height = crop_height
-                            crop_region, _ = expand_crop(crop_region, image_mask.width, image_mask.height, target_width, target_height)
-                            tile_size = p.width, p.height
-                        else:
-                            x1, y1, x2, y2 = crop_region
-                            crop_width = x2 - x1
-                            crop_height = y2 - y1
-                            target_width = math.ceil(crop_width / 8) * 8
-                            target_height = math.ceil(crop_height / 8) * 8
-                            crop_region, tile_size = expand_crop(crop_region, image_mask.width,
-                                                              image_mask.height, target_width, target_height)
-                        
-                        if p.mask_blur > 0:
-                            image_mask = image_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
-                            
-                        tiles = [img.crop(crop_region) for img in p.batch]
-                        initial_tile_size = tiles[0].size
-                        
-                        for i, tile in enumerate(tiles):
-                            if tile.size != tile_size:
-                                tiles[i] = tile.resize(tile_size, Image.Resampling.LANCZOS)
-                                
-                        positive_cropped = crop_cond(p.positive, crop_region, p.init_size, init_image.size, tile_size)
-                        negative_cropped = crop_cond(p.negative, crop_region, p.init_size, init_image.size, tile_size)
-                        
-                        # CRITICAL FIX: Custom tensor creation with correct BCHW format
-                        print("Creating batched_tiles with correct BCHW format...")
-                        tensors = []
-                        for tile in tiles:
-                            # Add critical diagnostic print right before tensor creation
-                            print(f"\n== CRITICAL TENSOR CONVERSION POINT ==")
-                            print(f"Input tile size: {tile.size}, mode: {tile.mode}")
-                            
-                            # Convert to numpy
-                            tile_array = np.array(tile).astype(np.float32) / 255.0
-                            print(f"Numpy array shape: {tile_array.shape}, dtype: {tile_array.dtype}")
-                            
-                            # Ensure RGB format
-                            if len(tile_array.shape) == 2:
-                                print("Converting grayscale to RGB")
-                                tile_array = np.stack([tile_array] * 3, axis=-1)
-                            elif tile_array.shape[2] == 4:
-                                print("Converting RGBA to RGB")
-                                tile_array = tile_array[:, :, :3]
-                            
-                            print(f"After format correction: {tile_array.shape}")
-                            
-                            # Check HWC format
-                            h, w, c = tile_array.shape
-                            print(f"Dimensions: Height={h}, Width={w}, Channels={c}")
-                            if c != 3:
-                                print(f"WARNING: Expected 3 channels, found {c}")
-                            
-                            # Create tensor in BCHW format directly (THIS IS THE CRITICAL POINT)
-                            print("Creating tensor with permute(2,0,1) - CHW format + adding batch")
-                            # THIS LINE IS WHERE TENSOR DIMS ARE SET FOR VAE INPUT
-                            tile_tensor = torch.from_numpy(tile_array).permute(2, 0, 1).unsqueeze(0)
-                            
-                            print(f"Final tensor shape: {tile_tensor.shape}")
-                            print(f"Tensor format: [B,C,H,W] = {list(tile_tensor.shape)}")
-                            
-                            # Explicit check to validate correct format
-                            b, c, h, w = tile_tensor.shape
-                            print(f"Confirmation - Batch: {b}, Channels: {c}, Height: {h}, Width: {w}")
-                            if c != 3:
-                                print("CRITICAL ERROR: Channel dimension is not 3! Will cause VAE error.")
-                                # Emergency fix
-                                print(f"Attempting emergency fix for tensor with wrong channel count...")
-                                if c > 3:
-                                    # Take first 3 channels if we somehow have more
-                                    tile_tensor = tile_tensor[:, :3, :, :]
-                                elif c < 3:
-                                    # Repeat channels if we have too few
-                                    tile_tensor = tile_tensor.repeat(1, 3 // c + 1, 1, 1)[:, :3, :, :]
-                                
-                                print(f"After emergency fix: {tile_tensor.shape}")
-                            
-                            tensors.append(tile_tensor)
-                            print("== END CRITICAL POINT ==\n")
-                        
-                        batched_tiles = torch.cat(tensors, dim=0)
-                        print(f"Created batched_tiles with shape: {batched_tiles.shape}")
-                        
-                        # Use direct VAE encode with extensive error checking
-                        print("\n=== CRITICAL VAE ENCODE CALL ===")
-                        print(f"Batched tiles shape before encode: {batched_tiles.shape}")
-                        
-                        # EXPLICIT TENSOR REORDERING FOR [1, 528, 0, 1024] ERROR CASE
-                        if batched_tiles.shape[1] != 3:
-                            print(f"CRITICAL ERROR: First dimension after batch should be channels (3), but got {batched_tiles.shape[1]}")
-                            
-                            # Check for the specific [1, 528, 0, 1024] error pattern
-                            if len(batched_tiles.shape) == 4 and batched_tiles.shape[1] > 3 and batched_tiles.shape[2] == 0:
-                                print("DETECTED THE SPECIFIC ERROR PATTERN: [1, 528, 0, 1024]")
-                                print("Explicitly reordering tensor dimensions...")
-                                
-                                # Extract the tensor shape values
-                                batch = batched_tiles.shape[0]  # Should be 1
-                                height = batched_tiles.shape[1]  # This is in the wrong position (e.g., 528)
-                                width = batched_tiles.shape[3]   # This is in the right position (e.g., 1024)
-                                
-                                # Create a completely new tensor with proper shape [1, 3, height, width]
-                                print(f"Creating new tensor with explicitly ordered dimensions: [1, 3, {height}, {width}]")
-                                
-                                # Either reshape or create a new tensor
-                                try:
-                                    # Emergency repair with data values from original tensor if possible
-                                    print("Attempting to salvage data from original tensor...")
-                                    
-                                    # Best guess to attempt to extract most useful data from tensor
-                                    # We're dealing with a critically malformed tensor, so this is largely experimental
-                                    orig_data = batched_tiles.detach().cpu().numpy()
-                                    
-                                    # Create a new target tensor
-                                    corrected_tensor = torch.zeros((1, 3, height, width), 
-                                                                  dtype=batched_tiles.dtype,
-                                                                  device=batched_tiles.device)
-                                    
-                                    # Try to populate it with RGB values
-                                    # Average across available data if multi-dimensional
-                                    for c in range(3):  # RGB channels
-                                        # Fill with grayscale values derived from original tensor
-                                        # For safety, use mean value of original tensor
-                                        fill_value = 0.5  # Default gray
-                                        try:
-                                            if orig_data.size > 0:
-                                                fill_value = float(np.mean(orig_data))
-                                                fill_value = max(0, min(1, fill_value))  # Clamp to [0,1]
-                                        except:
-                                            pass
-                                            
-                                        corrected_tensor[:, c, :, :] = fill_value
-                                    
-                                    print(f"Created salvaged tensor with shape: {corrected_tensor.shape}")
-                                    batched_tiles = corrected_tensor
-                                    
-                                    # EXPLICIT SHAPE CHECK AFTER CORRECTION
-                                    print(f"CRITICAL CHECK - Tensor shape immediately after correction: {batched_tiles.shape}")
-                                    if batched_tiles.shape[1] != 3:
-                                        print(f"CORRECTION FAILED - Still has wrong number of channels: {batched_tiles.shape[1]}")
-                                        # Force the shape again to be absolutely certain
-                                        print("Forcing tensor shape one more time...")
-                                        batched_tiles = batched_tiles.reshape(1, 3, height, width)
-                                        print(f"After forced reshape: {batched_tiles.shape}")
-                                    
-                                except Exception as reshape_err:
-                                    print(f"Reshape failed: {reshape_err}")
-                                    # If all else fails, create a blank gray tensor
-                                    print("Creating blank gray tensor with correct dimensions")
-                                    batched_tiles = torch.ones((1, 3, height, width), 
-                                                              dtype=torch.float32, 
-                                                              device=batched_tiles.device) * 0.5
-                                    
-                                    # EXPLICIT VERIFICATION AFTER FINAL TENSOR CREATION
-                                    print(f"FINAL TENSOR SHAPE CHECK: {batched_tiles.shape}")
-                                    print(f"Channel dimension (should be 3): {batched_tiles.shape[1]}")
-                                    if batched_tiles.shape[1] != 3:
-                                        print("SEVERE ERROR: Channel dimension is still wrong after correction!")
-                                        # Try one last extreme measure - force reshape
-                                        try:
-                                            print("Forcing reshape with total element preservation...")
-                                            total_elements = batched_tiles.numel()
-                                            expected_elements = 1 * 3 * height * width
-                                            
-                                            if total_elements == expected_elements:
-                                                # Same number of elements, safe to reshape
-                                                batched_tiles = batched_tiles.reshape(1, 3, height, width)
-                                            else:
-                                                # Create new tensor, completely replacing the old one
-                                                batched_tiles = torch.ones((1, 3, height, width), 
-                                                                         dtype=torch.float32, 
-                                                                         device=batched_tiles.device) * 0.5
-                                            
-                                            print(f"After extreme measures: {batched_tiles.shape}")
-                                        except Exception as final_err:
-                                            print(f"Final reshape attempt failed: {final_err}")
-                                        
-                        print(f"Final tensor shape for VAE encode: {batched_tiles.shape}")
-                        print(f"Final dimensions: Batch={batched_tiles.shape[0]}, Channels={batched_tiles.shape[1]}, H={batched_tiles.shape[2]}, W={batched_tiles.shape[3]}")
-                        
-                        # Add a REM comment right at encode point
-                        print("### REM: ABOUT TO CALL VAE.ENCODE - THIS IS THE CRITICAL POINT ###")
-                        
-                        try:
-                            # Direct VAE encode call
-                            latent = p.vae.encode(batched_tiles)
-                            print(f"Success! Latent shape: {latent.shape}")
-                        except Exception as e:
-                            print(f"VAE encode failed: {e}")
-                            # One last emergency attempt with a simplified tensor
-                            print("Attempting final emergency encode with minimal valid tensor...")
-                            
-                            # Create a small valid tensor
-                            valid_tensor = torch.ones((1, 3, 512, 512), 
-                                                     dtype=torch.float32, 
-                                                     device=batched_tiles.device) * 0.5
-                            
-                            try:
-                                latent = p.vae.encode(valid_tensor)
-                                print(f"Emergency encode succeeded with shape: {latent.shape}")
-                                # Resize latent to expected dimensions (assuming 8x downsampling in VAE)
-                                target_h = batched_tiles.shape[2] // 8
-                                target_w = batched_tiles.shape[3] // 8
-                                if target_h > 0 and target_w > 0:
-                                    # Resize latent to match original dimensions
-                                    print(f"Resizing latent to {target_h}x{target_w}")
-                                    latent = torch.nn.functional.interpolate(
-                                        latent, size=(target_h, target_w), mode='bilinear'
-                                    )
-                            except Exception as e2:
-                                print(f"Emergency encode also failed: {e2}")
-                                print("Cannot proceed with VAE encode - must abort")
-                                raise
-                                
-                        print("=== END VAE ENCODE CALL ===\n")
-                        
-                        # Continue with the original logic
-                        samples = sample(p.model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler, positive_cropped,
-                                       negative_cropped, latent, p.denoise, p.custom_sampler, p.custom_sigmas)
-                                       
-                        if p.progress_bar_enabled and p.pbar is not None:
-                            p.pbar.update(1)
-                            
-                        # Decode directly with VAE (bypass wrapper)
-                        if not p.tiled_decode:
-                            decoded = p.vae.decode(samples)
-                        else:
-                            # Use tiled decode if available
-                            if hasattr(p.vae, 'decode_tiled'):
-                                decoded = p.vae.decode_tiled(samples, 512)
-                            else:
-                                print("[USDU] Tiled decode not available in VAE, falling back to regular decode")
-                                decoded = p.vae.decode(samples)
-                                
-                        # Convert back to PIL
-                        print(f"Decoded tensor shape: {decoded.shape}")
-                        tiles_sampled = []
-                        
-                        # Handle potential BCHW to BHWC conversion for tensor_to_pil
-                        for i in range(len(decoded)):
-                            # Extract and convert to BHWC if needed
-                            single_img = decoded[i:i+1]
-                            if single_img.shape[1] == 3 and single_img.shape[2] > 3 and single_img.shape[3] > 3:
-                                # It's in BCHW format, convert to BHWC for tensor_to_pil
-                                single_img = single_img.permute(0, 2, 3, 1)
-                            tiles_sampled.append(tensor_to_pil(single_img, 0))
-                        
-                        # Rest of the original function
-                        result_images = []
-                        for i, tile_sampled in enumerate(tiles_sampled):
-                            init_image = p.batch[i]
-                            if tile_sampled.size != initial_tile_size:
-                                tile_sampled = tile_sampled.resize(initial_tile_size, Image.Resampling.LANCZOS)
-                            image_tile_only = Image.new('RGBA', init_image.size)
-                            image_tile_only.paste(tile_sampled, crop_region[:2])
-                            temp = image_tile_only.copy()
-                            temp.putalpha(image_mask)
-                            image_tile_only.paste(temp, image_tile_only)
-                            result = init_image.convert('RGBA')
-                            result.alpha_composite(image_tile_only)
-                            result = result.convert('RGB')
-                            result_images.append(result)
-                            
-                        return Processed(p, result_images, p.seed, None)
-                    
-                    # Replace the original process_images function with our patched version
-                    globals()['process_images'] = patched_process_images
-                    
-                except Exception as vae_test_err:
-                    print(f"VAE test failed: {vae_test_err}")
-                    import traceback
-                    traceback.print_exc()
-                
-                print("----- END CRITICAL DIAGNOSTIC -----\n")
-                
-                processed = process_images(p)
-                final_image = processed.images[0]
-                print(f"Successfully processed image with models: {final_image.size}")
-                
-                # Verify dimensions - resize if needed
-                if final_image.width != final_target_w or final_image.height != final_target_h:
-                    print(f"Resizing from {final_image.size} to target {final_target_w}x{final_target_h}")
-                    final_image = final_image.resize((final_target_w, final_target_h), 
-                                                  Image.Resampling.LANCZOS)
-            except Exception as e:
-                print(f"Error in model processing: {e}")
-                import traceback
-                traceback.print_exc()
-                
-                # Fallback to upscaler only
-                try:
-                    print("Falling back to upscaler model only")
-                    if upscale_model is not None:
-                        upscaler = Upscaler(upscale_model)
-                        final_image = upscaler.upscale(downscaled_pil, scale_factor)
-                    else:
-                        # Use Lanczos as last resort
-                        final_image = downscaled_pil.resize((final_target_w, final_target_h), 
-                                                         Image.Resampling.LANCZOS)
-                except Exception as e2:
-                    print(f"Upscaler fallback failed: {e2}")
-                    # Last resort: use Lanczos
-                    final_image = downscaled_pil.resize((final_target_w, final_target_h), 
-                                                     Image.Resampling.LANCZOS)
-            
-            # Convert final image to tensor
-            final_np = np.array(final_image).astype(np.float32) / 255.0
-            final_tensor = torch.from_numpy(final_np).unsqueeze(0)
-            
-            # Move the tensor to the original device before adding to results
-            final_tensor = final_tensor.to(device)
-            
-            result_tensors.append(final_tensor)
-            
-            # Clean up GPU memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            print(f"Error processing image: {e}")
-            import traceback
-            traceback.print_exc()
-            # Provide a placeholder result or skip
-            continue
-    
-    # Check if we have any results
-    if not result_tensors:
-        print("No images were successfully processed")
-        return None
-        
-    # Combine all processed images
-    if len(result_tensors) > 1:
-        result = torch.cat(result_tensors, dim=0)
-    else:
-        result = result_tensors[0]
-    
-    print(f"Processing complete: {result.shape}")
-    return result
+            from usdu_patch import usdu
+            # Use the original script if available
+            return usdu.Script().run(p=p, _=_, **kwargs)
+        except ImportError:
+            print("[USDU] Warning: usdu_patch module not found, using built-in implementation")
+            # Fallback to our implementation
+            return process_images(p)
+#######################################################
+# SECTION 8: MAIN NODE IMPLEMENTATION
+#######################################################
 
-#-------------------------------------------------------
-# ComfyUI Node Implementation
-#-------------------------------------------------------
-
+# The UltimateSDUpscale node with buckets support
 class HTDetectionBatchProcessor:
     """
-    Node for detecting regions, processing with mask dilation, and scaling detected regions.
-    Combines BBOX detection, masking, and model-based upscaling in one workflow.
-    Uses standard bucket sizes (512, 768, 1024) with additional scale factor.
-    Memory-optimized for large images and regions.
+    ComfyUI node that implements Ultimate SD Upscale with bucket support.
+    Detects objects in images and upscales them to standardized dimensions.
     """
     
-    CATEGORY = "HommageTools/Processor"
-    FUNCTION = "process"
-    RETURN_TYPES = ("IMAGE", "MASK", "SEGS", "IMAGE", "IMAGE", "INT")
-    RETURN_NAMES = ("processed_images", "processed_masks", "segs", "cropped_images", "bypass_image", "bbox_count")
-    OUTPUT_IS_LIST = (True, True, False, True, False, False)
-    
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "detection_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "mask_dilation": ("INT", {"default": 4, "min": -512, "max": 512, "step": 1}),
-                "crop_factor": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 10.0, "step": 0.1}),
-                "drop_size": ("INT", {"min": 1, "max": MAX_RESOLUTION, "step": 1, "default": 10}),
-                "tile_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
-                "scale_mode": (["Scale Closest", "Scale Up", "Scale Down", "Scale Max"], {"default": "Scale Closest"}),
-                "scale_factor": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 4.0, "step": 0.01}),
-                "divisibility": (["8", "64"], {"default": "64"}),
-                "mask_blur": ("INT", {"default": 4, "min": 0, "max": 64, "step": 1}),
-                "overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
-                "max_size_mp": ("FLOAT", {"default": 50.0, "min": 1.0, "max": 500.0, "step": 0.1}),
-                # KSampler parameters
-                "model": ("MODEL",),
-                "vae": ("VAE",),
-                "steps": ("INT", {"default": 20, "min": 1, "max": 100, "step": 1}),
-                "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-                "denoise": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler_ancestral"}),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "normal"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff})
-            },
-            "optional": {
-                "bbox_detector": ("BBOX_DETECTOR",),
-                "upscale_model": ("UPSCALE_MODEL",),
-                "positive": ("CONDITIONING",),
-                "negative": ("CONDITIONING",),
-                "labels": ("STRING", {"multiline": True, "default": "all", "placeholder": "List types of segments to allow, comma-separated"})
-            }
+    def INPUT_TYPES(s):
+        """Define inputs for the node."""
+        required = {
+            "image": ("IMAGE",),  # Will accept batch of images
+            # Sampling Params
+            "model": ("MODEL",),
+            "positive": ("CONDITIONING",),
+            "negative": ("CONDITIONING",),
+            "vae": ("VAE",),
+            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            "steps": ("INT", {"default": 20, "min": 1, "max": 10000, "step": 1}),
+            "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
+            "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+            "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+            "denoise": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01}),
+            # Upscale Params
+            "upscale_model": ("UPSCALE_MODEL",),
+            "mode_type": (list(MODES.keys()),),
+            "tile_width": ("INT", {"default": 512, "min": 64, "max": MAX_RESOLUTION, "step": 8}),
+            "tile_height": ("INT", {"default": 512, "min": 64, "max": MAX_RESOLUTION, "step": 8}),
+            "mask_blur": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1}),
+            "tile_padding": ("INT", {"default": 32, "min": 0, "max": MAX_RESOLUTION, "step": 8}),
+            # Seam fix params
+            "seam_fix_mode": (list(SEAM_FIX_MODES.keys()),),
+            "seam_fix_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "seam_fix_width": ("INT", {"default": 64, "min": 0, "max": MAX_RESOLUTION, "step": 8}),
+            "seam_fix_mask_blur": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1}),
+            "seam_fix_padding": ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8}),
+            # Detection Params
+            "detection_model": ("BBOX_DETECTOR",),
+            "detection_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "detection_dilation": ("INT", {"default": 4, "min": -512, "max": 512, "step": 1}),
+            "crop_factor": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 100, "step": 0.1}),
+            "drop_size": ("INT", {"min": 1, "max": MAX_RESOLUTION, "step": 1, "default": 10}),
+            # Bucket Params (NEW)
+            "scale_mode": ([mode.value for mode in ScaleMode], {"default": "max"}),
+            "short_edge_div": ([div.name for div in ShortEdgeDivisibility], {"default": "DIV_BY_8"}),
+            "mask_dilation": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 2.0, "step": 0.05}),
+            "use_buckets": ("BOOLEAN", {"default": True, "label": "Use target buckets"}),
+            # Misc
+            "force_uniform_tiles": ("BOOLEAN", {"default": True}),
+            "tiled_decode": ("BOOLEAN", {"default": False}),
         }
-    
-    def calculate_target_size(self, bbox_size, mode="Scale Closest"):
-        """Calculate target size based on standard buckets."""
-        STANDARD_BUCKETS = [512, 768, 1024]
         
-        if mode == "Scale Closest":
-            target = min(STANDARD_BUCKETS, key=lambda x: abs(x - bbox_size))
-        elif mode == "Scale Up":
-            target = next((x for x in STANDARD_BUCKETS if x >= bbox_size), STANDARD_BUCKETS[-1])
-        elif mode == "Scale Down":
-            target = next((x for x in reversed(STANDARD_BUCKETS) if x <= bbox_size), STANDARD_BUCKETS[0])
-        else:  # Scale Max
-            target = STANDARD_BUCKETS[-1]
-        
-        return target
-    
-    def process(self, image, detection_threshold, mask_dilation, crop_factor, drop_size, tile_size, 
-            scale_mode, scale_factor, divisibility, mask_blur, overlap, max_size_mp, model, vae, steps, cfg, 
-            denoise, sampler_name, scheduler, seed, bbox_detector=None, upscale_model=None, 
-            positive=None, negative=None, labels="all"):
+        optional = {
+            "segs": ("SEGS", {"default": None}),
+            "use_provided_segs": ("BOOLEAN", {"default": False, "label": "Use provided SEGS instead of detecting"}),
+            "segs_upscale_separately": ("BOOLEAN", {"default": True, "label": "Upscale SEGS separately"}),
+            "detection_upscale_model": ("UPSCALE_MODEL", {"default": None}),
+            "use_detection_upscaler": ("BOOLEAN", {"default": False, "label": "Use separate upscaler for SEGS"}),
+            "sam_model_opt": ("SAM_MODEL", {"default": None}),
+            "segm_detector_opt": ("SEGM_DETECTOR", {"default": None})
+        }
+
+        return {"required": required, "optional": optional}
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("upscaled_image", "cropped_batch", "scale_info")
+    FUNCTION = "upscale"
+    CATEGORY = "image/upscaling"
+
+    def upscale(self, image, model, positive, negative, vae, seed,
+                steps, cfg, sampler_name, scheduler, denoise, upscale_model,
+                mode_type, tile_width, tile_height, mask_blur, tile_padding,
+                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
+                seam_fix_width, seam_fix_padding, detection_model, detection_threshold,
+                detection_dilation, crop_factor, drop_size, scale_mode, short_edge_div,
+                mask_dilation, use_buckets, force_uniform_tiles, tiled_decode,
+                segs=None, use_provided_segs=False, segs_upscale_separately=True,
+                detection_upscale_model=None, use_detection_upscaler=False,
+                sam_model_opt=None, segm_detector_opt=None):
         """
-        Enhanced process method that uses the UltimateSDUpscaler approach.
+        Main upscaling function that processes either segments or whole images.
         """
-        print(f"HTDetectionBatchProcessor starting")
+        # Store params
+        self.tile_width = tile_width
+        self.tile_height = tile_height
+        self.mask_blur = mask_blur
+        self.tile_padding = tile_padding
+        self.seam_fix_width = seam_fix_width
+        self.seam_fix_denoise = seam_fix_denoise
+        self.seam_fix_padding = seam_fix_padding
+        self.seam_fix_mode = seam_fix_mode
+        self.mode_type = mode_type
+        self.seam_fix_mask_blur = seam_fix_mask_blur
         
-        # Convert divisibility from string to int
-        div_factor = int(divisibility)
+        # Convert string enum choices to actual enum values
+        scale_mode_enum = ScaleMode(scale_mode)
+        short_edge_div_enum = ShortEdgeDivisibility[short_edge_div]
+
+        # IMPORTANT: All global declarations must appear here at the top
+        # before any usage of these variables
+        global sd_upscalers, actual_upscaler, batch
         
-        # Initialize empty lists for results
-        processed_images = []
-        processed_masks = []
-        cropped_images = []
-        bypass_image = image
-        bbox_count = 0
+        # Set up required globals
+        sd_upscalers[0] = UpscalerData()
         
-        # Ensure BHWC format for input image
-        if len(image.shape) == 3:  # HWC
-            image = image.unsqueeze(0)  # Add batch dimension
-        elif len(image.shape) == 4 and image.shape[1] <= 4 and image.shape[2] > 4 and image.shape[3] > 4:
-            # BCHW format, convert to BHWC
-            image = image.permute(0, 2, 3, 1)
+        # For storing scale info
+        scale_info = []
         
-        # Step 1: Run BBOX detection
-        if bbox_detector is not None:
-            print("Running BBOX detection...")
-            
-            # Always use first image if batch > 1
-            detect_image = image[0:1] if image.shape[0] > 1 else image
-            
-            try:
-                # Execute detection
-                segs = bbox_detector.detect(detect_image, detection_threshold, mask_dilation, crop_factor, drop_size)
-                
-                # Check if valid detection result
-                if not isinstance(segs, tuple) or len(segs) < 2:
-                    print(f"Invalid detection result format: {type(segs)}")
-                    return [], [], ((10, 10), []), [], image, 0
-                
-                print(f"Detection found {len(segs[1])} segments")
-                
-                # Filter segments by label if specified
-                if labels != '' and labels != 'all':
-                    label_list = [label.strip() for label in labels.split(',')]
-                    print(f"Filtering for labels: {label_list}")
-                    
-                    filtered_segs = []
-                    for seg in segs[1]:
-                        if hasattr(seg, 'label') and seg.label in label_list:
-                            filtered_segs.append(seg)
-                    
-                    print(f"Filtered to {len(filtered_segs)} segments")
-                    segs = (segs[0], filtered_segs)
-            except Exception as e:
-                print(f"Detection error: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                return [], [], ((10, 10), []), [], image, 0
+        # Get SEGS - either from provided input or by running detection
+        working_segs = None
+        if use_provided_segs and segs is not None:
+            working_segs = segs
+            print(f"[USDU] Using provided SEGS with {len(segs[1])} items")
         else:
-            print("No detector provided!")
-            return [], [], ((10, 10), []), [], image, 0
+            # Run detection using provided detector
+            print(f"[USDU] Running detection with threshold {detection_threshold}")
+            if segm_detector_opt is not None:
+                # Use SimpleDetectorForEach to get SEGS with the provided detectors
+                working_segs = SimpleDetectorForEach.detect(
+                    detection_model, image, detection_threshold, detection_dilation, 
+                    crop_factor, drop_size, 0.5, 0, 0, 0.7, 0,
+                    sam_model_opt=sam_model_opt, segm_detector_opt=segm_detector_opt)
+            else:
+                # Fallback to basic detection without segmentation refinement
+                working_segs = detection_model.detect(image, detection_threshold, detection_dilation, crop_factor, drop_size)
+            
+            print(f"[USDU] Detection completed, found {len(working_segs[1])} regions")
         
-        # Step 2: Process each detection
-        if not segs[1] or len(segs[1]) == 0:
-            print("No detections found")
-            return [], [], segs, [], image, 0
-        
-        print(f"Processing {len(segs[1])} detected regions...")
-        bbox_count = len(segs[1])
-        
-        # Process each segment
-        for i, seg in enumerate(segs[1]):
-            try:
-                print(f"Processing region {i+1}/{len(segs[1])}: {seg.label if hasattr(seg, 'label') else 'Unknown'}")
-                
-                # Extract crop region
-                x1, y1, x2, y2 = seg.crop_region
-                crop_width = x2 - x1
-                crop_height = y2 - y1
-                print(f"Crop dimensions: {crop_width}x{crop_height}")
-                
-                # Direct cropping from the original image - more reliable than using seg.cropped_image
-                orig_img = image.clone()
-                cropped_image = orig_img[:, y1:y2, x1:x2, :]
-                print(f"Cropped image shape: {cropped_image.shape}")
-                
-                # Verify that the crop is valid
-                if cropped_image.shape[1] == 0 or cropped_image.shape[2] == 0 or cropped_image.numel() == 0:
-                    print(f"Invalid crop dimensions, skipping this region")
-                    continue
-                
-                # Special handling for tensors with unusual shapes like (1,1,N)
-                if cropped_image.shape[1] == 1 and cropped_image.shape[2] == 1 and cropped_image.shape[3] > 4:
-                    print(f"Detected flattened tensor {cropped_image.shape}, reshaping to 2D image")
-                    # Assuming this is a flattened 2D image, try to reshape it
-                    long_edge = int(math.sqrt(cropped_image.shape[3]))
-                    short_edge = cropped_image.shape[3] // long_edge
-                    
-                    # Create properly shaped tensor
-                    proper_image = torch.zeros((1, short_edge, long_edge, 3), 
-                                              dtype=cropped_image.dtype,
-                                              device=cropped_image.device)
-                    
-                    # Original dimensions should be preserved from the crop_region
-                    print(f"Reshaping to proper dimensions: {crop_height}x{crop_width}")
-                    proper_image = torch.zeros((1, crop_height, crop_width, 3), 
-                                              dtype=torch.float32,
-                                              device=cropped_image.device)
-                    
-                    # Fill with gray (0.5) to make it visible
-                    proper_image.fill_(0.5)
-                    
-                    # Use this as the cropped image
-                    cropped_image = proper_image
-                    print(f"Created placeholder image with shape {cropped_image.shape}")
-                
-                # Store cropped image in results
-                cropped_images.append(cropped_image.clone())
-                
-                # Create a simple full mask for the cropped region
-                cropped_mask = torch.ones((1, crop_height, crop_width, 1), dtype=torch.float32, device=cropped_image.device)
-                
-                # Calculate target size using standard buckets
-                long_edge = max(crop_width, crop_height)
-                target_size = self.calculate_target_size(long_edge, scale_mode)
-                
-                print(f"Crop size: {crop_width}x{crop_height}, target size: {target_size}")
-                
-                # Process image using the enhanced process_with_model function
-                processed = process_with_model(
-                    image=cropped_image,
-                    upscale_model=upscale_model,
-                    target_size=target_size,
-                    scale_factor=scale_factor,
-                    divisibility=div_factor,
-                    tile_size=tile_size,
-                    overlap=overlap,
-                    model=model,
-                    vae=vae,
-                    positive=positive,
-                    negative=negative,
-                    seed=seed + i,  # Different seed for each region
-                    steps=steps,
-                    cfg=cfg,
-                    sampler_name=sampler_name,
-                    scheduler=scheduler,
-                    denoise=denoise,
-                    mask_blur=mask_blur,
-                    mask_dilation=mask_dilation
+        # Process SEGS if available
+        if working_segs is not None:
+            print(f"[USDU] Processing detected regions")
+            
+            # If using buckets, process SEGS with bucket adjustment
+            if use_buckets:
+                image_batch, crop_regions, target_dimensions, scale_types, bucket_sizes = process_segs_with_buckets(
+                    working_segs, image, scale_mode_enum, short_edge_div_enum, mask_dilation
                 )
                 
-                if processed is not None:
-                    # Scale mask to match processed image dimensions
-                    processed_h, processed_w = processed.shape[1:3]
+                # Generate scale info for output
+                for i, (region, target_dim, scale_type, bucket_size) in enumerate(zip(crop_regions, target_dimensions, scale_types, bucket_sizes)):
+                    x1, y1, x2, y2 = region
+                    width, height = target_dim
+                    scale_info.append(f"Region {i+1}: {x2-x1}x{y2-y1} → {width}x{height} ({scale_type}, bucket: {bucket_size})")
+            else:
+                # Original SEGS processing without buckets
+                image_batch, crop_regions = segs_to_image_batch(working_segs, image)
+                scale_info.append("Bucket sizing disabled")
+            
+            # Empty SEGS check - no crops detected
+            if len(crop_regions) == 0:
+                print("[USDU] No valid regions detected")
+                # Return 1x1 black pixel for outputs
+                empty_tensor = torch.zeros(1, 1, 1, 3)
+                return (empty_tensor, empty_tensor, "No regions detected")
+            
+            # Store the raw cropped batch for output
+            raw_cropped_batch = image_batch.clone()
+            
+            # Determine which upscale model to use for SEGS regions
+            current_upscale_model = detection_upscale_model if use_detection_upscaler and detection_upscale_model is not None else upscale_model
+            
+            # Set the upscaler for SEGS regions
+            actual_upscaler = current_upscale_model
+            print(f"[USDU] Using {'detection' if use_detection_upscaler and detection_upscale_model is not None else 'primary'} upscaler for regions")
+            
+            if segs_upscale_separately:
+                # Process each segmented region separately
+                result_images = []
+                
+                for i in range(len(image_batch)):
+                    # Process single crop
+                    batch = [tensor_to_pil(image_batch[i:i+1])]
                     
-                    # Create a full mask for the processed region
-                    scaled_mask = torch.ones((1, processed_h, processed_w, 1), dtype=torch.float32, device=processed.device)
+                    # If using buckets, use the target dimensions to determine upscale factor
+                    if use_buckets:
+                        original_width, original_height = batch[0].size
+                        target_width, target_height = target_dimensions[i]
+                        
+                        # Calculate effective upscale factor based on target dimensions
+                        width_factor = target_width / original_width
+                        height_factor = target_height / original_height
+                        effective_upscale = max(width_factor, height_factor)
+                        
+                        # Override upscale_by for this segment
+                        current_upscale_by = effective_upscale
+                    else:
+                        current_upscale_by = 2.0  # Default value
                     
-                    # Add results to output lists
-                    processed_images.append(processed)
-                    processed_masks.append(scaled_mask)
+                    # Create processing object for this crop
+                    sdprocessing = StableDiffusionProcessing(
+                        batch[0], model, positive, negative, vae,
+                        seed, steps, cfg, sampler_name, scheduler, denoise, current_upscale_by, 
+                        force_uniform_tiles, tiled_decode, tile_width, tile_height, 
+                        MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode]
+                    )
+                    
+                    # Set the image mask for this batch item
+                    sdprocessing.image_mask = Image.new('L', (batch[0].width, batch[0].height), 255)
+                    sdprocessing.init_images = [batch[0]]
+                    
+                    # If using buckets, override the target custom scale
+                    custom_scale = effective_upscale if use_buckets else 2.0
+                    
+                    # Run upscaling process
+                    script = Script()
+                    script.run(
+                        p=sdprocessing, 
+                        _=None, 
+                        tile_width=self.tile_width, 
+                        tile_height=self.tile_height,
+                        mask_blur=self.mask_blur, 
+                        padding=self.tile_padding, 
+                        seams_fix_width=self.seam_fix_width,
+                        seams_fix_denoise=self.seam_fix_denoise, 
+                        seams_fix_padding=self.seam_fix_padding,
+                        upscaler_index=0, 
+                        save_upscaled_image=False, 
+                        redraw_mode=MODES[self.mode_type],
+                        save_seams_fix_image=False, 
+                        seams_fix_mask_blur=self.seam_fix_mask_blur,
+                        seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], 
+                        target_size_type=2,
+                        custom_width=None, 
+                        custom_height=None, 
+                        custom_scale=custom_scale
+                    )
+                    
+                    # If using buckets, resize to exact target dimensions
+                    if use_buckets:
+                        processed_img = batch[0]
+                        target_width, target_height = target_dimensions[i]
+                        if processed_img.width != target_width or processed_img.height != target_height:
+                            processed_img = processed_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                            batch[0] = processed_img
+                    
+                    # Get the processed image
+                    result_images.append(pil_to_tensor(batch[0]))
+                    print(f"[USDU] Processed SEGS {i+1}/{len(image_batch)}")
+                
+                # Stack the results into a tensor
+                processed_batch = torch.cat(result_images, dim=0)
+                
+                # Reconstruct the full image by placing crops back
+                result_tensor = reconstruct_from_crops(image, processed_batch, crop_regions)
+                return (result_tensor, raw_cropped_batch, "\n".join(scale_info))
+            
+            else:
+                # Process all crops as a single batch
+                batch = [tensor_to_pil(image_batch[i:i+1]) for i in range(len(image_batch))]
+                
+                # If using buckets, we need to process each crop separately anyway
+                # since each may have different dimensions/upscale factors
+                if use_buckets:
+                    # Process separately and collect results
+                    processed_crops = []
+                    
+                    for i, img in enumerate(batch):
+                        current_batch = [img]
+                        
+                        # Get original and target dimensions
+                        original_width, original_height = img.size
+                        target_width, target_height = target_dimensions[i]
+                        
+                        # Calculate effective upscale factor
+                        width_factor = target_width / original_width
+                        height_factor = target_height / original_height
+                        effective_upscale = max(width_factor, height_factor)
+                        
+                        # Create processing object for this crop
+                        sdprocessing = StableDiffusionProcessing(
+                            img, model, positive, negative, vae,
+                            seed, steps, cfg, sampler_name, scheduler, denoise, effective_upscale,
+                            force_uniform_tiles, tiled_decode, tile_width, tile_height,
+                            MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode]
+                        )
+                        
+                        # Set the image mask for this batch item
+                        sdprocessing.image_mask = Image.new('L', img.size, 255)
+                        sdprocessing.init_images = [img]
+                        
+                        # Process this crop
+                        batch = current_batch
+                        
+                        script = Script()
+                        script.run(
+                            p=sdprocessing, 
+                            _=None, 
+                            tile_width=self.tile_width, 
+                            tile_height=self.tile_height,
+                            mask_blur=self.mask_blur, 
+                            padding=self.tile_padding, 
+                            seams_fix_width=self.seam_fix_width,
+                            seams_fix_denoise=self.seam_fix_denoise, 
+                            seams_fix_padding=self.seam_fix_padding,
+                            upscaler_index=0, 
+                            save_upscaled_image=False, 
+                            redraw_mode=MODES[self.mode_type],
+                            save_seams_fix_image=False, 
+                            seams_fix_mask_blur=self.seam_fix_mask_blur,
+                            seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], 
+                            target_size_type=2,
+                            custom_width=None, 
+                            custom_height=None, 
+                            custom_scale=effective_upscale
+                        )
+                        
+                        # Resize to exact target dimensions
+                        processed_img = batch[0]
+                        if processed_img.width != target_width or processed_img.height != target_height:
+                            processed_img = processed_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                        
+                        processed_crops.append(processed_img)
+                    
+                    # Update batch with processed crops
+                    batch = processed_crops
+                
                 else:
-                    print(f"Processing failed for region {i+1}, skipping")
+                    # Original approach - process as single batch with uniform upscale factor
+                    # Create processing object
+                    sdprocessing = StableDiffusionProcessing(
+                        batch[0], model, positive, negative, vae,
+                        seed, steps, cfg, sampler_name, scheduler, denoise, 2.0, force_uniform_tiles, tiled_decode,
+                        tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode]
+                    )
+                    
+                    # Set image mask for all batch items
+                    sdprocessing.image_mask = Image.new('L', (batch[0].width, batch[0].height), 255)
+                    sdprocessing.init_images = batch
+                    
+                    # Process the entire batch
+                    script = Script()
+                    script.run(
+                        p=sdprocessing, 
+                        _=None, 
+                        tile_width=self.tile_width, 
+                        tile_height=self.tile_height,
+                        mask_blur=self.mask_blur, 
+                        padding=self.tile_padding, 
+                        seams_fix_width=self.seam_fix_width,
+                        seams_fix_denoise=self.seam_fix_denoise, 
+                        seams_fix_padding=self.seam_fix_padding,
+                        upscaler_index=0, 
+                        save_upscaled_image=False, 
+                        redraw_mode=MODES[self.mode_type],
+                        save_seams_fix_image=False, 
+                        seams_fix_mask_blur=self.seam_fix_mask_blur,
+                        seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], 
+                        target_size_type=2,
+                        custom_width=None, 
+                        custom_height=None, 
+                        custom_scale=2.0
+                    )
                 
-                # Clean up GPU memory
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Convert all PIL images back to tensors
+                tensors = [pil_to_tensor(img) for img in batch]
+                processed_batch = torch.cat(tensors, dim=0)
                 
-            except Exception as e:
-                print(f"Error processing region {i+1}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                # Continue with next segment
+                # Reconstruct the full image
+                result_tensor = reconstruct_from_crops(image, processed_batch, crop_regions)
+                return (result_tensor, raw_cropped_batch, "\n".join(scale_info))
         
-        print(f"Processing complete - returning {len(processed_images)} images")
-        
-        # Check if we have any results
-        if not processed_images:
-            # Create minimal placeholder
-            placeholder = torch.zeros((1, 10, 10, 3), dtype=torch.float32)
-            placeholder_mask = torch.ones((1, 10, 10, 1), dtype=torch.float32)
-            return [placeholder], [placeholder_mask], segs, [placeholder], image, 0
-        
-        return processed_images, processed_masks, segs, cropped_images, bypass_image, bbox_count
+        # Original processing path (no SEGS)
+        else:
+            # Reset upscaler to primary for non-SEGS processing
+            actual_upscaler = upscale_model
+            
+            # Convert all input images to PIL for batch processing
+            batch = [tensor_to_pil(image, i) for i in range(len(image))]
+            
+            # Get the first image to initialize processing
+            # Each image will be processed individually in a batch
+            first_image = tensor_to_pil(image, 0)
+            
+            # For non-SEGS mode with buckets, calculate dimensions for the whole image
+            if use_buckets:
+                for i, img in enumerate(batch):
+                    width, height = img.size
+                    target_width, target_height, scale_type, bucket_size = calculate_bucket_dimensions(
+                        width, height, scale_mode_enum, short_edge_div_enum, mask_dilation
+                    )
+                    scale_info.append(f"Image {i+1}: {width}x{height} → {target_width}x{target_height} ({scale_type}, bucket: {bucket_size})")
+                    
+                    # Calculate effective upscale
+                    width_factor = target_width / width
+                    height_factor = target_height / height
+                    effective_upscale = max(width_factor, height_factor)
+                    current_upscale_by = effective_upscale
+            else:
+                scale_info.append("Bucket sizing disabled")
+                current_upscale_by = 2.0  # Default upscale factor
+            
+            # Create processing object
+            sdprocessing = StableDiffusionProcessing(
+                first_image, model, positive, negative, vae,
+                seed, steps, cfg, sampler_name, scheduler, denoise, current_upscale_by, force_uniform_tiles, tiled_decode,
+                tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode]
+            )
+
+            # Disable logging during processing
+            import logging
+            logger = logging.getLogger()
+            old_level = logger.getEffectiveLevel()
+            logger.setLevel(logging.CRITICAL + 1)
+            try:
+                # Get access to USDU script
+                try:
+                    from usdu_patch import usdu
+                    script = usdu.Script()
+                except ImportError:
+                    # If USDU script is not available, use our implementation
+                    print("[USDU] Warning: usdu_patch module not found, using built-in implementation")
+                    script = Script()
+                    
+                # Process each image in the batch
+                result_images = []
+                
+                # Store original batch
+                original_batch = batch.copy()
+                
+                # Process each image separately
+                for i in range(len(original_batch)):
+                    # Set the current image as the only one in the batch
+                    batch = [original_batch[i]]
+                    
+                    # If using buckets, calculate dimensions for this specific image
+                    if use_buckets:
+                        width, height = batch[0].size
+                        target_width, target_height, scale_type, bucket_size = calculate_bucket_dimensions(
+                            width, height, scale_mode_enum, short_edge_div_enum, mask_dilation
+                        )
+                        
+                        # Calculate effective upscale factor
+                        width_factor = target_width / width
+                        height_factor = target_height / height
+                        effective_upscale = max(width_factor, height_factor)
+                        
+                        # Override upscale_by for this image
+                        sdprocessing.upscale_by = effective_upscale
+                    
+                    # Set the image mask for this batch item
+                    sdprocessing.image_mask = Image.new('L', (batch[0].width, batch[0].height), 255)
+                    sdprocessing.init_images = [batch[0]]
+                    
+                    # If using buckets, override the target custom scale
+                    custom_scale = effective_upscale if use_buckets else 2.0
+                    
+                    # Run upscaling process
+                    processed = script.run(
+                        p=sdprocessing, 
+                        _=None, 
+                        tile_width=self.tile_width, 
+                        tile_height=self.tile_height,
+                        mask_blur=self.mask_blur, 
+                        padding=self.tile_padding, 
+                        seams_fix_width=self.seam_fix_width,
+                        seams_fix_denoise=self.seam_fix_denoise, 
+                        seams_fix_padding=self.seam_fix_padding,
+                        upscaler_index=0, 
+                        save_upscaled_image=False, 
+                        redraw_mode=MODES[self.mode_type],
+                        save_seams_fix_image=False, 
+                        seams_fix_mask_blur=self.seam_fix_mask_blur,
+                        seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], 
+                        target_size_type=2,
+                        custom_width=None, 
+                        custom_height=None, 
+                        custom_scale=custom_scale
+                    )
+                    
+                    # If using buckets, resize the final image to target dimensions
+                    if use_buckets:
+                        processed_img = batch[0]
+                        if processed_img.width != target_width or processed_img.height != target_height:
+                            processed_img = processed_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                            batch[0] = processed_img
+                    
+                    # Store the processed image
+                    result_images.append(batch[0])
+                    
+                    # Print progress
+                    print(f"[USDU] Processed image {i+1}/{len(original_batch)}")
+                
+                # Convert all PIL images back to tensors and combine into a batch
+                tensors = [pil_to_tensor(img) for img in result_images]
+                combined_tensor = torch.cat(tensors, dim=0)
+                return (combined_tensor, image, "\n".join(scale_info))
+            finally:
+                # Restore the original logging level
+                logger.setLevel(old_level)
+
+# Export the node
+NODE_CLASS_MAPPINGS = {
+    "ht_detection_batch_processor_v2": HTDetectionBatchProcessor,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ht_detection_batch_processor_v2": "Ultimate SD Upscale with Buckets",
+}

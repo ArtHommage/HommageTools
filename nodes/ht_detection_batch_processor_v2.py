@@ -28,9 +28,26 @@ def pil_to_tensor(image):
     return img.permute(0, 3, 1, 2)
 
 def tensor_to_pil(tensor, index=0):
-    """Convert PyTorch tensor to PIL image"""
-    i = 255.0 * tensor[index].cpu().permute(1, 2, 0).numpy()
-    i = np.clip(i, 0, 255).astype(np.uint8)
+    """
+    Convert a PyTorch tensor to a PIL image, ensuring the tensor shape
+    is compatible (B, C, H, W), with C in [1, 3, 4].
+    """
+    # Check the number of dimensions
+    if tensor.ndim != 4:
+        raise ValueError(f"Expected a 4D tensor of shape (B,C,H,W), but got shape {tuple(tensor.shape)}")
+    
+    b, c, h, w = tensor.shape
+    if c not in [1, 3, 4]:
+        raise ValueError(
+            f"Expected channel dimension in [1, 3, 4], but got c={c}. "
+            "Make sure your tensor is actually an image (e.g., grayscale, RGB, or RGBA)."
+        )
+    
+    # Permute from (B,C,H,W) to (H,W,C) for PIL and pick a batch index
+    i = tensor[index].cpu().permute(1, 2, 0).numpy()
+    # Scale if data is in [0,1] range, then convert to uint8
+    i = (255.0 * i).clip(0, 255).astype("uint8")
+    
     return Image.fromarray(i)
 
 def get_crop_region(mask, padding):
