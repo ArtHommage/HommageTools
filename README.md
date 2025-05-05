@@ -5,6 +5,8 @@ A comprehensive collection of utility nodes for ComfyUI that enhance your workfl
 ![GitHub](https://img.shields.io/github/license/ArtHommage/HommageTools)
 ![GitHub last commit](https://img.shields.io/github/last-commit/ArtHommage/HommageTools)
 
+> **⚠️ DISCLAIMER: These nodes are perpetually in alpha status and highly experimental. They should NOT be used for production. The author reserves the right to alter or discontinue them without notice or warranty.**
+
 ## 🚀 Overview
 
 HommageTools is designed to fill functionality gaps in ComfyUI with professional-grade utility nodes that follow best practices for performance and compatibility. Each node is carefully crafted to handle BHWC tensor formats correctly and includes proper error handling.
@@ -56,6 +58,14 @@ Comprehensive text cleanup with configurable rules for formatting. This node per
 - **Internal Mechanics**: Applies a series of processing steps including whitespace normalization, punctuation cleanup, and multiple formatting passes. The node uses configurable rules to preserve specific formatting elements when desired.
 - **Purpose**: Creates consistently formatted text for reliable prompt results, fixing common issues like double spaces, inconsistent line breaks, and messy punctuation
 - **Use Cases**: Standardize prompt formats for consistent results, prepare text for processing by other nodes, clean up user inputs, normalize text from different sources
+
+#### HT Dynamic Prompt (`HTDynamicPromptNode`)
+Enhanced dynamic prompt generation with token limiting. This node expands dynamic prompt syntax into final prompts with wildcard substitution and variation handling.
+- **Inputs**: Text template, seed, autorefresh option, whitespace handling, token limit, optional CLIP model
+- **Outputs**: Generated prompt, token info, CLIP passthrough
+- **Internal Mechanics**: Processes templates with wildcards (`__wildcard__`), variations (`{option1|option2}`), and other dynamic prompt syntax. Includes accurate token counting to avoid exceeding model limits.
+- **Purpose**: Creates varied prompts from templates for exploration and batch processing
+- **Use Cases**: Prompt variation for batch generation, automated prompt experimentation, consistent random prompt generation with reproducible seeds
 
 ### Image Processing Nodes
 
@@ -115,6 +125,22 @@ Enhanced Intel Open Image Denoise implementation with proper tensor handling. Th
 - **Purpose**: Provides AI-powered, industry-standard denoising capabilities directly within ComfyUI
 - **Use Cases**: Clean up noisy AI-generated images, improve quality of renders, remove grain while preserving details, prepare images for further processing or final output
 
+#### HT Scale By (`HTScaleByNode`)
+Scales images by a factor with mask support and proper format handling. This node provides precise scaling with optional mask integration.
+- **Inputs**: Image, scale factor, interpolation method, crop to mask flag, optional mask
+- **Outputs**: Scaled image, scaled mask
+- **Internal Mechanics**: Validates and normalizes input tensors to BHWC format, calculates target dimensions based on scale factor, and performs high-quality interpolation with format preservation. Can optionally crop to mask content before scaling for focused processing.
+- **Purpose**: Provides precise control over image scaling with awareness of mask content areas
+- **Use Cases**: Upscale or downscale by precise factors, focus scaling on masked regions, prepare images and masks together for further processing
+
+#### HT Moiré Removal (`HTMoireRemovalNode`)
+Removes moiré patterns from images with advanced frequency domain filtering. This node combines multiple filter techniques to eliminate interference patterns common in scanned or photographed images.
+- **Inputs**: Image, filter strength and parameters, tile size mode, normalization options
+- **Outputs**: Filtered image
+- **Internal Mechanics**: Applies a combination of median filtering, Butterworth filtering, and notch filtering with tiled processing for memory efficiency. Uses global normalization for consistent results across tiles and includes proper overlap blending to avoid seams.
+- **Purpose**: Eliminates moiré patterns that commonly appear when photographing or scanning images with fine patterns
+- **Use Cases**: Clean up scanned illustrations, remove screen patterns from photographed displays, improve quality of digitized printed materials, prepare images for further AI processing
+
 #### HT Save Image Plus (`HTSaveImagePlus`)
 Enhanced image saving with multiple format support and metadata options. This node extends ComfyUI's image saving capabilities with advanced options and format support.
 - **Inputs**: Images, output format (PNG, JPEG, TIFF), filename options, quality settings, mask (for alpha channel), text content (for accompanying text files), metadata controls
@@ -122,6 +148,22 @@ Enhanced image saving with multiple format support and metadata options. This no
 - **Internal Mechanics**: Handles proper conversion between tensor formats and image formats, manages alpha channel integration from masks, supports embedding metadata in supported formats, and optionally creates accompanying text files with the same base name.
 - **Purpose**: Provides comprehensive image saving capabilities beyond the basic options, with control over format, quality, metadata, and accompanying text
 - **Use Cases**: Save images with custom metadata for workflow tracking, save in multiple formats for different purposes, include masks as alpha channels, add text notes or prompt information in accompanying files, control compression and quality settings
+
+#### HT Detection Batch Processor (`HTDetectionBatchProcessor`)
+Processes batches of detected regions with upscaling and post-processing. This node handles object detection results and applies processing to each region.
+- **Inputs**: Image, detection model, processing parameters, scaling options
+- **Outputs**: Processed image, cropped batch, scale information
+- **Internal Mechanics**: Extracts detected regions from an image, applies optional bucket-based sizing to standardize dimensions, and processes each region with configurable parameters. Handles proper BHWC tensor format throughout.
+- **Purpose**: Enables targeted processing of specific image regions based on detection results
+- **Use Cases**: Upscale detected objects while leaving backgrounds untouched, apply different processing to different image elements, standardize detected elements to consistent sizes, batch process multiple detections efficiently
+
+#### HT Gemini (`HTGeminiNode`)
+Interface with Google's Gemini AI for text and image processing. This node provides access to Gemini's multimodal capabilities for content generation.
+- **Inputs**: Model, system instructions, content, temperature, optional image, generation parameters
+- **Outputs**: Generated text, status information
+- **Internal Mechanics**: Connects to Google's Gemini API, handles proper authentication and API key management, processes inputs in BHWC format for images, and manages generation parameters for customized outputs.
+- **Purpose**: Integrates Google's powerful Gemini AI models directly into ComfyUI workflows
+- **Use Cases**: Generate descriptions of images, create captions, get creative writing based on visual inputs, generate code or analytical content based on images and text prompts
 
 ### Dimension Handling Nodes
 
@@ -165,10 +207,18 @@ Crops images to mask content and calculates scaling factors. This node focuses o
 - **Purpose**: Focuses processing on the relevant content area defined by a mask, enabling more efficient and targeted operations
 - **Use Cases**: Focus processing on masked regions, extract subjects from backgrounds, calculate appropriate scaling for masked content, prepare masked regions for further processing at optimal sizes
 
+#### HT Multi Mask Dilate (`HTMultiMaskDilationNode`)
+Detects and crops multiple regions from a mask with BHWC tensor handling. This node handles batch processing of multiple masked regions.
+- **Inputs**: Image, mask, scale mode, padding, connectivity, max regions
+- **Outputs**: Cropped masks, cropped images, widths, heights, scale factors, is multi-region flag, region count, region indices
+- **Internal Mechanics**: Detects connected components in the mask, extracts each region with proper BHWC handling, and calculates appropriate scaling factors for each. Supports batched processing and produces aligned output batches.
+- **Purpose**: Enables parallel processing of multiple detected regions within an image
+- **Use Cases**: Extract multiple subjects from an image, process different regions with distinct parameters, prepare multiple regions for batch processing, isolate components of complex images
+
 #### HT Tensor Info (`HTTensorInfoNode`)
 Displays tensor shape information in BHWC format with detailed analysis. This node helps with debugging by providing comprehensive information about tensor dimensions and format.
 - **Inputs**: Image tensor
-- **Outputs**: Image (passthrough), shape information
+- **Outputs**: Image (passthrough), shape info
 - **Internal Mechanics**: Analyzes the input tensor to determine its format (BHWC or HWC), dimensions, and other properties. Produces a detailed text description of the tensor's properties while passing the tensor through unchanged.
 - **Purpose**: Provides essential debugging information about tensors to help troubleshoot dimension and format issues
 - **Use Cases**: Debug tensor dimensions and formats, verify tensor transformations, check batch size and channel count, monitor tensor changes throughout a workflow, help diagnose format compatibility issues
@@ -222,6 +272,24 @@ Calculates base shift values for images with BHWC tensor handling. This node com
 - **Inputs**: Image width, height, max shift, base shift (optional image tensor)
 - **Outputs**: Max shift, base shift
 - **Internal Mechanics**: Calculates shift values using a formula that accounts for image dimensions. Can extract dimensions directly from image tensors in BHWC format or use provided width/height values. The formula adjusts shift values proportionally to image size for optimal results.
+- **Purpose**: Provides optimized base shift parameters for stable diffusion based on image dimensions
+- **Use Cases**: Dynamic shift parameter calculation based on image size, optimize image-to-image parameters automatically, calibrate generation settings for different resolutions
+
+#### HT Seed (`HTSeedNode`)
+Simple seed generator node with random seed capabilities. This node provides basic random seed generation with toggle options.
+- **Inputs**: Seed, random seed flag, force random seed flag
+- **Outputs**: Seed value
+- **Internal Mechanics**: Handles fixed or random seeds with optional forcing for each execution. Uses a cryptographically strong random number generator for consistent, high-quality randomness.
+- **Purpose**: Provides reliable and flexible seeding options for reproducible generation
+- **Use Cases**: Basic seed management, togglable random seeding, seed control for testing and comparison
+
+#### HT Seed Advanced (`HTSeedAdvancedNode`)  
+Advanced seed generator with multiple modes and outputs. This node provides comprehensive seeding control for complex workflows.
+- **Inputs**: Base seed, random options, seed mode (standard, fixed, iter_add, iter_mult, derived), mode-specific parameters, iteration count, text input
+- **Outputs**: Seed, subseed, iteration_seed, seed_info
+- **Internal Mechanics**: Implements multiple seeding modes including iteration-based and text-derived seeds. Calculates related subseeds for consistency and includes UI integration with seed updates.
+- **Purpose**: Provides advanced seeding control for complex workflows with multiple related seeds
+- **Use Cases**: Create sequences of related seeds, derive consistent seeds from text, iterate through seed sequences, generate matched seed/subseed pairs
 
 ### Utility and Control Nodes
 
@@ -229,73 +297,97 @@ Calculates base shift values for images with BHWC tensor handling. This node com
 Simple switch node that triggers once when activated.
 - **Inputs**: Enabled flag
 - **Outputs**: Trigger state
-- **Use Cases**: One-time triggers for workflow control
+- **Internal Mechanics**: Maintains internal state to trigger only once when enabled, until disabled again. Prevents continuous triggering.
+- **Purpose**: Provides controlled trigger signals for one-time operations
+- **Use Cases**: One-time triggers for workflow control, prevent action repetition, create controlled event sequences
 
 #### HT Status Indicator (`HTStatusIndicatorNode`)
 Displays status indicators based on input values.
 - **Inputs**: Any value input
 - **Outputs**: Passthrough of input
-- **Use Cases**: Visual workflow status monitoring
+- **Internal Mechanics**: Evaluates input values of any type to determine status (positive/negative). Sends status updates to the UI for visual indication while passing through the original input.
+- **Purpose**: Provides visual feedback about node states or conditions
+- **Use Cases**: Visual workflow status monitoring, condition display, process state visualization, debug visual indicators
 
 #### HT Conversion (`HTConversionNode`)
 Simple type conversion between string, integer, and float values.
 - **Inputs**: String input
 - **Outputs**: String, int, float conversions
-- **Use Cases**: Convert between data types for different nodes
+- **Internal Mechanics**: Attempts to convert the input string to multiple types (int, float) while preserving the original string. Handles conversion errors gracefully.
+- **Purpose**: Bridges different node types by converting between data formats
+- **Use Cases**: Convert between data types for different nodes, extract numeric values from text, prepare values for type-specific nodes
 
 #### HT Value Mapper (`HTValueMapperNode`)
 Maps input labels to values using a configurable mapping list.
 - **Inputs**: Mapping list, input value
 - **Outputs**: String, float, int, boolean outputs
-- **Use Cases**: Translate between UI-friendly labels and processing values
+- **Internal Mechanics**: Parses a mapping list of label:value pairs, matches input against labels, and returns corresponding values in multiple formats. Includes specialized boolean interpretation.
+- **Purpose**: Creates flexible mappings between user-friendly labels and processing values
+- **Use Cases**: Translate between UI-friendly labels and processing values, create custom enumerations, implement lookup tables, simplify complex parameter selections
 
 #### HT Flexible (`HTFlexibleNode`)
 A flexible node that can handle any input/output type.
 - **Inputs**: Any input, fallback type
 - **Outputs**: Passthrough or fallback value
-- **Use Cases**: Dynamic type handling, workflow organization
+- **Internal Mechanics**: Automatically adapts to connected nodes' types, passing through any input value or providing a fallback of the specified type if no input is connected.
+- **Purpose**: Provides maximum flexibility for dynamic workflows and experimentation
+- **Use Cases**: Dynamic type handling, workflow organization, prototype development, conditional value selection
 
 #### HT Inspector (`HTInspectorNode`)
 Inspects and reports input types and values for debugging.
 - **Inputs**: Any input
 - **Outputs**: Passthrough of input
-- **Use Cases**: Debug complex workflows and data flows
+- **Internal Mechanics**: Analyzes the input to determine its type, shape, and content. Sends detailed information to the UI while passing through the original input unchanged.
+- **Purpose**: Provides detailed runtime information about data flowing through the workflow
+- **Use Cases**: Debug complex workflows and data flows, inspect tensor contents, verify data transformations, examine intermediate values
 
 #### HT Widget Control (`HTWidgetControlNode`)
 Controls widget values at the system level with targeting.
 - **Inputs**: Mode, target widget, targeting options
 - **Outputs**: None (affects UI state)
-- **Use Cases**: Programmatic control of UI widgets
+- **Internal Mechanics**: Injects values into ComfyUI's widget system to control UI elements programmatically. Supports targeting by class name or specific node ID.
+- **Purpose**: Enables programmatic control of UI widgets for automation
+- **Use Cases**: Programmatic control of UI widgets, workflow automation, dynamic interface adjustment, coordinated parameter changes
 
 #### HT Splitter (`HTSplitterNode`)
 Routes a single input to two possible outputs based on a condition.
 - **Inputs**: Input value, condition
 - **Outputs**: Output true, output false
-- **Use Cases**: Conditional processing paths
+- **Internal Mechanics**: Routes the input value to one of two outputs based on the boolean condition. Handles tensor formats correctly with proper BHWC preservation.
+- **Purpose**: Creates conditional processing paths in workflows
+- **Use Cases**: Conditional processing paths, A/B testing, branch selection, error handling paths
 
 #### HT Node State Controller (`HTNodeStateController`)
 Controls multiple node states with boolean flip capability.
 - **Inputs**: Node IDs, default state, boolean input
 - **Outputs**: Signal output (passthrough)
-- **Use Cases**: Toggle groups of nodes on/off
+- **Internal Mechanics**: Sends state control commands to multiple target nodes based on node IDs. Supports conditional state flipping based on boolean input.
+- **Purpose**: Provides centralized control over multiple nodes' active/mute states
+- **Use Cases**: Toggle groups of nodes on/off, conditional workflow sections, A/B testing setups, workflow organization
 
 #### HT Unmute All (`HTNodeUnmuteAll`)
 Unmutes all nodes in the workflow with signal pass-through.
 - **Inputs**: Optional signal input
 - **Outputs**: Signal output (passthrough)
-- **Use Cases**: Reset workflow state
+- **Internal Mechanics**: Identifies all nodes in the current workflow and sends commands to ensure they are all in active (unmuted) state.
+- **Purpose**: Provides a quick way to reset all nodes to active state
+- **Use Cases**: Reset workflow state, recover from experimental configurations, ensure full workflow execution
 
 #### HT Null Value (`HTNullNode`)
 Provides null/empty values for optional inputs.
 - **Inputs**: Value type selection
 - **Outputs**: Null value of specified type
-- **Use Cases**: Provide empty inputs for optional node connections
+- **Internal Mechanics**: Creates appropriately typed null/empty values based on the selected type. Enables clean workflow connections without data.
+- **Purpose**: Provides properly typed empty values for optional inputs
+- **Use Cases**: Provide empty inputs for optional node connections, create placeholder connections, disable certain processing paths
 
 #### HT Console Logger (`HTConsoleLoggerNode`)
 Prints custom messages to console with input passthrough.
 - **Inputs**: Message, timestamp option, optional input
 - **Outputs**: Passthrough of input
-- **Use Cases**: Debug logging, progress tracking
+- **Internal Mechanics**: Formats and prints messages to the console with optional timestamps while passing through the input value unchanged.
+- **Purpose**: Provides flexible logging capabilities for workflow debugging
+- **Use Cases**: Debug logging, progress tracking, value inspection, execution sequence verification
 
 ### Model Management Nodes
 
@@ -303,7 +395,9 @@ Prints custom messages to console with input passthrough.
 Loads multiple diffusion models from a text list with metadata extraction.
 - **Inputs**: Model list, current index, weight dtype
 - **Outputs**: Model, model name, model info
-- **Use Cases**: Batch processing with multiple models
+- **Internal Mechanics**: Parses a list of model names, loads the model at the specified index, and extracts detailed metadata from the model file. Supports special weight formats and optimizations.
+- **Purpose**: Enables working with multiple models in a single workflow
+- **Use Cases**: Batch processing with multiple models, model comparison, sequential model application, model metadata inspection
 
 ## 🔧 Advanced Usage Examples
 
