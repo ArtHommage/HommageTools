@@ -1,21 +1,25 @@
 """
 File: homage_tools/nodes/ht_parameter_extractor.py
-Version: 1.0.0
-Description: Node for extracting labeled parameters from text
+Version: 1.3.0
+Description: Robust parameter extractor with comprehensive error handling
 """
 
 import re
-from typing import Tuple, Dict, Any, Optional, List
+from typing import Tuple, Dict, Any, Optional, List, Match
 
 class HTParameterExtractorNode:
     """
-    Extracts labeled parameter values from text strings with custom identifiers.
+    Extracts labeled parameter values from text strings with robust handling
+    of multiline text, adjacent parameters, and complex formatting.
     """
     
     CATEGORY = "HommageTools"
     FUNCTION = "extract_parameter"
     RETURN_TYPES = ("STRING", "STRING", "STRING", "FLOAT", "INT")
     RETURN_NAMES = ("parsed_text", "label", "value_string", "value_float", "value_int")
+    
+    # Version tracking
+    VERSION = "1.3.0"
     
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
@@ -36,31 +40,70 @@ class HTParameterExtractorNode:
                 }),
                 "clear_parameters": ("BOOLEAN", {
                     "default": False
+                }),
+                "debug_mode": ("BOOLEAN", {
+                    "default": True
                 })
             }
         }
 
-    def _find_parameter(
+    def _extract_params_with_regex(
         self,
         text: str,
         identifier: str,
         separator: str,
-        label: str
-    ) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
-        """Find and extract a labeled parameter."""
-        pattern = f"{re.escape(identifier)}([^{re.escape(separator)}]+){re.escape(separator)}"
-        matches = list(re.finditer(pattern, text))
-        all_params = [match.group(0) for match in matches]
+        debug_mode: bool
+    ) -> List[Tuple[str, str, str]]:
+        """
+        Find all parameters using a more robust regex approach.
         
-        for match in matches:
-            param_text = match.group(1).strip()
-            if "=" not in param_text:
+        Args:
+            text: Input text to search
+            identifier: Parameter identifier string
+            separator: Parameter terminator string
+            debug_mode: Whether to print debug info
+            
+        Returns:
+            List of tuples (full_parameter_string, label, value)
+        """
+        results = []
+        
+        # First normalize newlines
+        normalized_text = text.replace('\r\n', '\n').replace('\r', '\n')
+        
+        # Create a pattern that captures everything between identifier and separator
+        # Using re.DOTALL to match across line breaks
+        pattern = f"{re.escape(identifier)}(.*?){re.escape(separator)}"
+        matches = list(re.finditer(pattern, normalized_text, re.DOTALL))
+        
+        if debug_mode:
+            print(f"Debug: Found {len(matches)} raw parameter matches")
+        
+        for i, match in enumerate(matches):
+            full_param = match.group(0)  # The entire matched text
+            param_content = match.group(1).strip()  # Just the content between identifier and separator
+            
+            # Skip if no equals sign
+            if "=" not in param_content:
+                if debug_mode:
+                    print(f"Debug: Parameter {i+1} has no '=' sign, skipping: '{param_content}'")
                 continue
-            param_label, value = param_text.split("=", 1)
-            if param_label.strip().lower() == label.lower():
-                return match.group(0), param_label.strip(), value.strip(), all_params
+            
+            # Split on first equals sign only
+            try:
+                param_label, value = param_content.split("=", 1)
+                param_label = param_label.strip()
+                value = value.strip()
                 
-        return None, None, None, all_params
+                if debug_mode:
+                    print(f"Debug: Extracted parameter: '{param_label}' = '{value}'")
+                
+                results.append((full_param, param_label, value))
+            except ValueError:
+                if debug_mode:
+                    print(f"Debug: Error processing parameter content: '{param_content}'")
+        
+        return results
 
     def extract_parameter(
         self,
@@ -68,29 +111,81 @@ class HTParameterExtractorNode:
         separator: str,
         identifier: str,
         label: str,
-        clear_parameters: bool
+        clear_parameters: bool,
+        debug_mode: bool = True
     ) -> Tuple[str, str, str, float, int]:
-        """Extract and convert parameters."""
-        param_text, found_label, value, all_params = self._find_parameter(
-            input_text, identifier, separator, label
-        )
+        """
+        Extract and convert parameters from text.
         
+        Args:
+            input_text: Text containing parameters
+            separator: Parameter terminator string
+            identifier: Parameter identifier string
+            label: Parameter label to extract
+            clear_parameters: Whether to remove all parameters from output
+            debug_mode: Whether to print debug info
+            
+        Returns:
+            Tuple containing (parsed_text, label, value_string, value_float, value_int)
+        """
+        # Ensure we have input
+        if not input_text:
+            return ("", "", "", 0.0, 0)
+            
+        # Find all parameters
+        all_params = self._extract_params_with_regex(input_text, identifier, separator, debug_mode)
+        
+        if debug_mode:
+            print(f"Debug: Extracted {len(all_params)} valid parameters")
+            for i, (full, param_label, value) in enumerate(all_params):
+                print(f"Debug: Parameter {i+1}: '{param_label}' = '{value}'")
+        
+        # Find the requested parameter by label
+        found_param = None
+        for full_param, param_label, value in all_params:
+            if param_label.lower() == label.lower():
+                found_param = (full_param, param_label, value)
+                if debug_mode:
+                    print(f"Debug: Found requested parameter '{label}' = '{value}'")
+                break
+        
+        # Handle output text
         output_text = input_text
+        
         if clear_parameters:
-            for param in all_params:
-                output_text = output_text.replace(param, "")
-        elif param_text:
-            output_text = output_text.replace(param_text, "")
+            # Remove all parameters
+            for full_param, _, _ in all_params:
+                output_text = output_text.replace(full_param, "")
+            if debug_mode:
+                print(f"Debug: Removed all {len(all_params)} parameters")
+        elif found_param:
+            # Only remove the found parameter
+            full_param, _, _ = found_param
+            output_text = output_text.replace(full_param, "")
+            if debug_mode:
+                print(f"Debug: Removed parameter '{full_param}'")
         
-        output_text = " ".join(output_text.split())
+        # Clean up result by normalizing whitespace while preserving intentional line breaks
+        lines = [line.strip() for line in output_text.split('\n')]
+        output_text = '\n'.join([' '.join(line.split()) for line in lines])
+        output_text = output_text.strip()
         
-        if value:
+        # Handle conversion of values
+        if found_param:
+            _, param_label, value = found_param
             try:
                 float_val = float(value)
                 int_val = int(float_val)
+                if debug_mode:
+                    print(f"Debug: Converted value '{value}' to float={float_val}, int={int_val}")
             except (ValueError, TypeError):
                 float_val = 0.0
                 int_val = 0
-            return (output_text, found_label, value, float_val, int_val)
+                if debug_mode:
+                    print(f"Debug: Couldn't convert value '{value}' to numbers, using defaults")
+            return (output_text, param_label, value, float_val, int_val)
             
+        # No parameter found
+        if debug_mode:
+            print(f"Debug: No parameter with label '{label}' found")
         return (output_text, "", "", 0.0, 0)

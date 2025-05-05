@@ -1,7 +1,7 @@
 """
-File: homage_tools/nodes/ht_resolution_downsample_node.py
-Description: Node for downsampling images to a target resolution with mask support
-Version: 1.2.0
+File: homage_tools/nodes/ht_scale_by_node.py
+Description: Node for scaling images by a factor with mask support
+Version: 1.0.0
 """
 
 import torch
@@ -15,7 +15,7 @@ logger = logging.getLogger('HommageTools')
 #------------------------------------------------------------------------------
 # Section 1: Constants and Configuration
 #------------------------------------------------------------------------------
-VERSION = "1.2.0"
+VERSION = "1.0.0"
 
 #------------------------------------------------------------------------------
 # Section 2: Helper Functions
@@ -95,24 +95,14 @@ def verify_mask_dimensions(mask: torch.Tensor, context: str) -> Tuple[int, int, 
 def calculate_target_dimensions(
     current_height: int,
     current_width: int,
-    target_long_edge: int
-) -> Tuple[int, int, float]:
-    """Calculate target dimensions maintaining aspect ratio."""
-    current_long_edge = max(current_height, current_width)
-    aspect_ratio = current_width / current_height
+    scale_factor: float
+) -> Tuple[int, int]:
+    """Calculate target dimensions based on scale factor."""
+    target_height = int(round(current_height * scale_factor))
+    target_width = int(round(current_width * scale_factor))
     
-    scale_factor = target_long_edge / current_long_edge
-    print(f"Scale factor: {scale_factor:.3f}")
-    
-    if current_width >= current_height:
-        new_width = target_long_edge
-        new_height = int(round(new_width / aspect_ratio))
-    else:
-        new_height = target_long_edge
-        new_width = int(round(new_height * aspect_ratio))
-        
-    print(f"Target dimensions: {new_width}x{new_height}")
-    return new_height, new_width, scale_factor
+    print(f"Target dimensions: {target_width}x{target_height}")
+    return target_height, target_width
 
 def find_mask_bbox(mask: torch.Tensor) -> Tuple[int, int, int, int]:
     """Find bounding box of non-zero values in mask."""
@@ -168,15 +158,15 @@ def crop_to_mask_bbox(image: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Te
 #------------------------------------------------------------------------------
 # Section 3: Processing Functions
 #------------------------------------------------------------------------------
-def process_downsample(
+def process_scale(
     image: torch.Tensor,
     target_height: int,
     target_width: int,
     interpolation: str,
     device: torch.device
 ) -> torch.Tensor:
-    """Process downsampling operation maintaining BHWC format."""
-    print(f"Processing downsample: shape={image.shape} (BHWC)")
+    """Process scaling operation maintaining BHWC format."""
+    print(f"Processing scale: shape={image.shape} (BHWC)")
     print(f"Target size: {target_width}x{target_height}")
     
     # Check for unusual tensor shapes or values
@@ -232,7 +222,7 @@ def process_downsample(
         
         return result
     except Exception as e:
-        print(f"[ERROR] Downsample processing error: {str(e)}")
+        print(f"[ERROR] Scale processing error: {str(e)}")
         print(f"[DEBUG] Error details: {e.__class__.__name__}")
         # Return original image resized using a more robust method
         print(f"[DEBUG] Falling back to safer resize method...")
@@ -245,15 +235,15 @@ def process_downsample(
             # Last resort: return original
             return image
 
-def process_mask_downsample(
+def process_mask_scale(
     mask: torch.Tensor,
     target_height: int,
     target_width: int,
     interpolation: str,
     device: torch.device
 ) -> torch.Tensor:
-    """Process mask downsampling operation."""
-    print(f"Processing mask downsample: shape={mask.shape}")
+    """Process mask scaling operation."""
+    print(f"Processing mask scale: shape={mask.shape}")
     print(f"Target size: {target_width}x{target_height}")
     
     # Move to processing device
@@ -296,13 +286,13 @@ def create_empty_mask(batch_size: int, height: int, width: int, device: torch.de
 #------------------------------------------------------------------------------
 # Section 4: Node Definition
 #------------------------------------------------------------------------------
-class HTResolutionDownsampleNode:
-    """Downsamples images to a target resolution with mask support."""
+class HTScaleByNode:
+    """Scales images by a factor with mask support."""
     
     CATEGORY = "HommageTools/Image"
-    FUNCTION = "downsample_to_resolution"
+    FUNCTION = "scale_by_factor"
     RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("downsampled_image", "downsampled_mask")
+    RETURN_NAMES = ("scaled_image", "scaled_mask")
     
     INTERPOLATION_MODES = ["nearest", "bilinear", "bicubic", "area", "lanczos"]
     
@@ -311,12 +301,12 @@ class HTResolutionDownsampleNode:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "target_long_edge": ("INT", {
-                    "default": 1024,
-                    "min": 64,
-                    "max": 8192,
-                    "step": 8,
-                    "description": "Target size for longest edge"
+                "scale_factor": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.1,
+                    "max": 8.0,
+                    "step": 0.01,
+                    "description": "Factor to scale image dimensions"
                 }),
                 "interpolation": (cls.INTERPOLATION_MODES, {
                     "default": "bicubic",
@@ -338,19 +328,19 @@ class HTResolutionDownsampleNode:
             }
         }
 
-    def downsample_to_resolution(
+    def scale_by_factor(
         self,
         image: torch.Tensor,
-        target_long_edge: int,
+        scale_factor: float,
         interpolation: str,
         crop_to_mask: bool,
         mask: Optional[torch.Tensor] = None,
         mask_interpolation: Optional[str] = "nearest"
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Downsample image and mask to target resolution."""
-        print(f"\nHTResolutionDownsampleNode v{VERSION} - Processing")
+        """Scale image and mask by factor."""
+        print(f"\nHTScaleByNode v{VERSION} - Processing")
         print(f"Input tensor shape: {image.shape}, dtype: {image.dtype}")
-        print(f"Target long edge: {target_long_edge}, Interpolation: {interpolation}")
+        print(f"Scale factor: {scale_factor}, Interpolation: {interpolation}")
         print(f"Crop to mask: {crop_to_mask}")
         
         if mask is not None:
@@ -378,7 +368,7 @@ class HTResolutionDownsampleNode:
                 if mask_height != height or mask_width != width:
                     print(f"Warning: Mask dimensions ({mask_height}x{mask_width}) don't match image ({height}x{width})")
                     # Resize mask to match image
-                    mask = process_mask_downsample(mask, height, width, "nearest", device)
+                    mask = process_mask_scale(mask, height, width, "nearest", device)
             
             # Process cropping if enabled and mask provided
             if crop_to_mask and mask is not None:
@@ -389,9 +379,6 @@ class HTResolutionDownsampleNode:
                 processed_images = []
                 processed_masks = []
                 
-                # Create full-sized output template for final reassembly
-                output_height, output_width, scale_factor = calculate_target_dimensions(height, width, target_long_edge)
-                
                 for i, (img, msk) in enumerate(zip(cropped_images, cropped_masks)):
                     print(f"Processing cropped item {i+1}/{len(cropped_images)}")
                     
@@ -399,23 +386,24 @@ class HTResolutionDownsampleNode:
                     _, crop_height, crop_width, _ = verify_tensor_dimensions(img, f"Crop {i}")
                     
                     # Calculate target dimensions for this crop
-                    crop_target_height, crop_target_width, _ = calculate_target_dimensions(
-                        crop_height, crop_width, target_long_edge
+                    crop_target_height, crop_target_width = calculate_target_dimensions(
+                        crop_height, crop_width, scale_factor
                     )
                     
                     # Resize cropped image
-                    resized_img = process_downsample(
+                    resized_img = process_scale(
                         img, crop_target_height, crop_target_width, interpolation, device
                     )
                     
-                    # Create new mask based on resized image
-                    # The mask is 1.0 everywhere within the crop
-                    new_mask = torch.ones((1, crop_target_height, crop_target_width), device=device)
+                    # Resize cropped mask
+                    resized_msk = process_mask_scale(
+                        msk, crop_target_height, crop_target_width, mask_interpolation, device
+                    )
                     
                     processed_images.append(resized_img)
-                    processed_masks.append(new_mask)
+                    processed_masks.append(resized_msk)
                 
-                # Use first processed image as the output format template
+                # Use first processed image/mask as the output
                 result_image = processed_images[0]
                 result_mask = processed_masks[0]
                 
@@ -424,8 +412,8 @@ class HTResolutionDownsampleNode:
                 print("Processing without cropping")
                 
                 # Calculate target dimensions
-                target_height, target_width, scale_factor = calculate_target_dimensions(
-                    height, width, target_long_edge
+                target_height, target_width = calculate_target_dimensions(
+                    height, width, scale_factor
                 )
                 
                 # Skip processing if no change needed
@@ -434,12 +422,12 @@ class HTResolutionDownsampleNode:
                     return (image, mask)
                 
                 # Process image
-                result_image = process_downsample(
+                result_image = process_scale(
                     image, target_height, target_width, interpolation, device
                 )
                 
                 # Process mask
-                result_mask = process_mask_downsample(
+                result_mask = process_mask_scale(
                     mask, target_height, target_width, mask_interpolation, device
                 )
             
@@ -456,7 +444,7 @@ class HTResolutionDownsampleNode:
             return (result_image, result_mask)
             
         except Exception as e:
-            print(f"[CRITICAL ERROR] in resolution downsample: {str(e)}")
+            print(f"[CRITICAL ERROR] in image scaling: {str(e)}")
             print(f"[DEBUG] Error type: {e.__class__.__name__}")
             import traceback
             traceback.print_exc()
