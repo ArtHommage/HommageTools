@@ -555,8 +555,13 @@ class HTGeminiNode:
                         if hasattr(usage, 'total_token_count'):
                             token_info = f", Tokens: {usage.total_token_count}"
                     
+                    # Clean up the response text by removing special tokens
+                    clean_results = str(response.text)       
+                    clean_results = clean_results.replace('</s>', '')
+                    clean_results = clean_results.replace('<s>', '')
+                    
                     status_msg = f"Success: Response generated in {elapsed_time:.2f} seconds{token_info}"
-                    return (response.text, status_msg)
+                    return (clean_results, status_msg)
                 else:
                     return ("", "Empty response received")
                     

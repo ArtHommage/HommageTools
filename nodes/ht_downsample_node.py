@@ -1,7 +1,7 @@
 """
 File: homage_tools/nodes/ht_resolution_downsample_node.py
-Description: Node for downsampling images to a target resolution with mask support
 Version: 1.2.0
+Description: Node for downsampling images to a target resolution with mask support
 """
 
 import torch
@@ -408,14 +408,15 @@ class HTResolutionDownsampleNode:
                         img, crop_target_height, crop_target_width, interpolation, device
                     )
                     
-                    # Create new mask based on resized image
-                    # The mask is 1.0 everywhere within the crop
-                    new_mask = torch.ones((1, crop_target_height, crop_target_width), device=device)
+                    # Resize cropped mask
+                    resized_msk = process_mask_downsample(
+                        msk, crop_target_height, crop_target_width, mask_interpolation, device
+                    )
                     
                     processed_images.append(resized_img)
-                    processed_masks.append(new_mask)
+                    processed_masks.append(resized_msk)
                 
-                # Use first processed image as the output format template
+                # Use first processed image/mask as the output
                 result_image = processed_images[0]
                 result_mask = processed_masks[0]
                 

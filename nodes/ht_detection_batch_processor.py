@@ -1,6 +1,6 @@
 """
 File: homage_tools/nodes/ht_detection_batch_processor.py
-Version: 1.2.0
+Version: 1.2.1
 Description: Node for batch processing detected regions with Stable Diffusion upscaling
 """
 
@@ -16,7 +16,7 @@ import comfy.samplers
 from typing import List, Tuple, Dict, Any, Optional, Union
 
 # Define version
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 #------------------------------------------------------------------------------
 # Section 1: Core Configuration and Enums
@@ -136,6 +136,17 @@ def process_segs_with_buckets(segs, original_image, scale_mode, short_edge_div, 
     """
     Process SEGS to fit into specified buckets.
     Returns a list of image crops for flexible processing.
+    
+    Mask handling:
+    - Each SEG contains a detection region with a corresponding mask
+    - The mask isolates the object in its bounding box
+    - When no objects are detected, we return a minimal empty tensor
+      to maintain workflow continuity but signal no content
+    
+    Bucket sizing:
+    - Crops may have widely varying aspect ratios and sizes
+    - Bucketing standardizes these dimensions for consistent processing
+    - The function calculates appropriate dimensions while maintaining aspect ratios
     """
     if segs is None or len(segs[1]) == 0:
         # Create a 1x1 black pixel image tensor for empty SEGS
@@ -181,6 +192,11 @@ def process_segs_with_buckets(segs, original_image, scale_mode, short_edge_div, 
         short_edge = crop_height if is_landscape else crop_width
         
         # Determine target bucket size based on scale mode
+        # This is where the core logic for bucket size selection happens:
+        # - Each crop needs to be sized to a standard dimension for consistency
+        # - Different scale modes offer flexibility in how this sizing occurs
+        # - The masks ensure that only the relevant content within these standard
+        #   dimensions is visible in the final output
         if scale_mode == ScaleMode.MAX or long_edge > MAX_BUCKET_SIZE:
             target_long_edge = MAX_BUCKET_SIZE
             scale_type = "down" if long_edge > MAX_BUCKET_SIZE else "up"
@@ -243,41 +259,70 @@ def process_segs_with_buckets(segs, original_image, scale_mode, short_edge_div, 
 
 def prepare_crop_batch(image_batch, crop_regions, original_image):
     """
-    Prepare cropped batch for output with proper formatting.
+    Prepare cropped batch for output with proper padding to consistent dimensions.
+    Ensures all crops are combined into a proper batch tensor with uniform dimensions.
+    
+    BHWC format handling:
+    - For multiple detected objects, each crop may have different dimensions
+    - We must standardize these to create a valid batch tensor
+    - The process preserves masks by:
+      1. Finding maximum height/width across all crops
+      2. Padding smaller crops with zeros (which become transparent in masked areas)
+      3. Stacking into a proper batch tensor with shape (num_crops, max_height, max_width, channels)
+    
+    This ensures downstream nodes like HT Save Image Plus receive a properly formatted
+    tensor, while the transparent padding doesn't affect the visible content.
     """
-    # Empty regions check
+    # Empty regions check - handle cases with no detections
     if len(crop_regions) == 0:
         print("[WARNING] No crop regions found")
         marker = original_image.clone()
-        marker[..., 0] = 1.0  # Red tint
+        marker[..., 0] = 1.0  # Red tint to indicate no regions found
         return marker
     
-    # Ensure proper dimensions
-    if isinstance(image_batch, list):
-        # Convert list to tensor if needed
-        if len(image_batch) > 0:
-            # Try to stack if shapes match
-            shapes = [img.shape for img in image_batch]
-            if all(s == shapes[0] for s in shapes):
-                image_batch = torch.cat(image_batch, dim=0)
+    # Handle list of image tensors (different crops of varying sizes)
+    if isinstance(image_batch, list) and len(image_batch) > 0:
+        # Find maximum dimensions across all crops - this is essential to create
+        # a consistent batch tensor that downstream nodes can process correctly
+        max_h = max([img.shape[1] for img in image_batch])
+        max_w = max([img.shape[2] for img in image_batch])
+        
+        print(f"[DEBUG] Found maximum dimensions: {max_w}x{max_h}")
+        
+        # Pad each crop to maximum dimensions - this standardizes the tensor shapes
+        # while preserving the content. The padding areas will be transparent in the
+        # final output if masks are used appropriately.
+        padded_crops = []
+        for i, img in enumerate(image_batch):
+            h, w = img.shape[1], img.shape[2]
+            pad_h = max_h - h
+            pad_w = max_w - w
+            
+            if pad_h > 0 or pad_w > 0:
+                print(f"[DEBUG] Padding crop {i+1}: adding {pad_w}x{pad_h} pixels")
+                # Padding: (left, right, top, bottom, channel_front, channel_back)
+                # For PyTorch's pad function with BHWC tensor, padding starts from last dim
+                # This order is crucial for maintaining proper BHWC format
+                pad_dims = (0, 0, 0, pad_w, 0, pad_h)
+                padded = torch.nn.functional.pad(img, pad_dims, mode='constant', value=0)
+                padded_crops.append(padded)
             else:
-                # Return first crop as representative sample
-                return image_batch[0]
+                padded_crops.append(img)
+        
+        # Stack into batch tensor along batch dimension (dim=0)
+        # This creates a properly formed BHWC tensor with uniform dimensions
+        try:
+            batched = torch.cat(padded_crops, dim=0)
+            print(f"[DEBUG] Created batch with shape {batched.shape}")
+            return batched
+        except Exception as e:
+            print(f"[ERROR] Failed to create batch: {e}")
+            # Fallback to first crop if stacking fails
+            # This preserves at least one detection for preview
+            return padded_crops[0]
     
-    # Format checking
-    if len(image_batch.shape) != 4:
-        print(f"[WARNING] Unusual batch shape: {image_batch.shape}")
-        if len(image_batch.shape) == 3 and image_batch.shape[-1] == 3:
-            image_batch = image_batch.unsqueeze(0)  # Add batch dimension
-        elif len(image_batch.shape) == 3 and image_batch.shape[0] == 3:
-            # Convert CHW to BHWC
-            image_batch = image_batch.permute(1, 2, 0).unsqueeze(0)
-    
-    # Verify batch size matches crop count
-    if image_batch.shape[0] != len(crop_regions):
-        print(f"[WARNING] Batch size {image_batch.shape[0]} doesn't match crop count {len(crop_regions)}")
-    
-    save_debug_image(image_batch, "prepared_crop_batch")
+    # Handle already batched tensor
+    print(f"[DEBUG] Using existing batched tensor: {image_batch.shape}")
     return image_batch
 
 def upscale_regions(image, crop_regions, target_dimensions, model, positive, negative, vae, seed,
@@ -288,6 +333,17 @@ def upscale_regions(image, crop_regions, target_dimensions, model, positive, neg
     """
     Upscale individual regions - this is a simplified version that gives the 
     basic process without trying to actually implement the full upscaling.
+    
+    Batch handling strategy:
+    - Each region (object) may have different dimensions and aspect ratios
+    - We process them individually to allow customization per object
+    - The results are then combined into a unified batch with consistent dimensions
+    - This approach allows different parameters per object while maintaining
+      compatibility with downstream nodes that expect uniform batch dimensions
+    
+    When no objects are found:
+    - Returns the original image to maintain workflow continuity
+    - Includes informative text explaining no regions were processed
     """
     # The full implementation would involve:
     # 1. Setting up SD processing for each crop
@@ -336,6 +392,10 @@ class HTDetectionBatchProcessor:
     def INPUT_TYPES(s):
         """Define inputs for the node."""
         required = {
+            "console_label": ("STRING", {
+                "default": "Detection Batch Processing",
+                "multiline": False
+            }),
             "image": ("IMAGE",),  # Will accept batch of images
             # Sampling Params
             "model": ("MODEL",),
@@ -392,7 +452,7 @@ class HTDetectionBatchProcessor:
     FUNCTION = "upscale"
     CATEGORY = "image/upscaling"
 
-    def upscale(self, image, model, positive, negative, vae, seed,
+    def upscale(self, console_label, image, model, positive, negative, vae, seed,
             steps, cfg, sampler_name, scheduler, denoise, upscale_model,
             mode_type, tile_width, tile_height, mask_blur, tile_padding,
             seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
@@ -404,7 +464,11 @@ class HTDetectionBatchProcessor:
         """
         Main upscaling function that processes either segments or whole images.
         """
-        # Print version info
+        # Print version info and console label
+        border = "=" * (len(console_label) + 4)
+        print(f"\n{border}")
+        print(f"= {console_label} =")
+        print(f"{border}")
         print(f"HTDetectionBatchProcessor v{VERSION} - Processing")
         
         # Store params for later use (if needed)
@@ -444,6 +508,16 @@ class HTDetectionBatchProcessor:
                 print(f"[USDU] Detection completed, found {len(working_segs[1]) if working_segs and len(working_segs) > 1 else 0} regions")
             
             # Check for empty SEGS
+            # This is a crucial check to handle cases with no detections, which can happen for various reasons:
+            # 1. No objects were detected in the image
+            # 2. All detections were below the confidence threshold
+            # 3. SEGS data structure is malformed
+            #
+            # By returning a minimal empty tensor (1x1x1x3) for the first output and the original image
+            # for the second, we achieve two important goals:
+            # - Provide visual feedback that no objects were found (empty tensor)
+            # - Allow workflow to continue with the original image available (second output)
+            # - Give clear error information (status text)
             if working_segs is None or not isinstance(working_segs, tuple) or len(working_segs) < 2 or not working_segs[1]:
                 print("[USDU] No valid regions detected")
                 # Return empty result for first output, original image for second
@@ -496,18 +570,8 @@ class HTDetectionBatchProcessor:
                 return (empty_tensor, image, "No valid regions detected")
             
             # Prepare crops for display
-            if isinstance(image_batch, list):
-                # We have a list of tensors - create a visualization
-                if len(image_batch) > 0:
-                    # Use first crop as representative
-                    raw_cropped_batch = image_batch[0]
-                    save_debug_image(raw_cropped_batch, "cropped_batch_example")
-                else:
-                    raw_cropped_batch = torch.zeros(1, 1, 1, 3)
-            else:
-                # We have a batched tensor
-                raw_cropped_batch = prepare_crop_batch(image_batch, crop_regions, image)
-                save_debug_image(raw_cropped_batch, "cropped_batch_prepared")
+            raw_cropped_batch = prepare_crop_batch(image_batch, crop_regions, image)
+            save_debug_image(raw_cropped_batch, "cropped_batch_prepared")
             
             # Process the regions with upscaling
             if segs_upscale_separately:

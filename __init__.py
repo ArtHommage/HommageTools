@@ -1,11 +1,12 @@
 """
 File: homage_tools/__init__.py
-Version: 1.3.0
+Version: 1.3.1
 Description: Initialization file for HommageTools node collection
 """
 
 import os
 import sys
+import shutil
 from typing import Dict, Type, Any
 
 #------------------------------------------------------------------------------
@@ -28,7 +29,45 @@ except Exception as e:
     raise
 
 #------------------------------------------------------------------------------
-# Section 2: Node Imports
+# Section 2: Web Directory Setup
+#------------------------------------------------------------------------------
+# Set up web directory structure
+WEB_DIRECTORY = os.path.join(EXTENSION_DIR, "web")
+JS_DIRECTORY = os.path.join(WEB_DIRECTORY, "js")
+
+# Create directories if they don't exist
+os.makedirs(JS_DIRECTORY, exist_ok=True)
+
+# Copy JS files from source to web directory
+def ensure_js_files():
+    """Copy JS files to the web directory"""
+    source_js_dir = os.path.join(EXTENSION_DIR, "js_src")
+    if os.path.exists(source_js_dir):
+        for filename in os.listdir(source_js_dir):
+            if filename.endswith(".js"):
+                source_path = os.path.join(source_js_dir, filename)
+                dest_path = os.path.join(JS_DIRECTORY, filename)
+                
+                # Only copy if source is newer
+                if not os.path.exists(dest_path) or os.path.getmtime(source_path) > os.path.getmtime(dest_path):
+                    shutil.copy2(source_path, dest_path)
+                    print(f"Updated JS file: {filename}")
+    
+    # Copy the seed advanced UI JavaScript file directly
+    # This is a special case for the file we need to fix
+    seed_js_src = os.path.join(EXTENSION_DIR, "nodes", "ht_seed_advanced_ui.js")
+    seed_js_dest = os.path.join(JS_DIRECTORY, "ht_seed_advanced_ui.js")
+    
+    if os.path.exists(seed_js_src):
+        if not os.path.exists(seed_js_dest) or os.path.getmtime(seed_js_src) > os.path.getmtime(seed_js_dest):
+            shutil.copy2(seed_js_src, seed_js_dest)
+            print(f"Updated HT Seed Advanced UI JavaScript")
+
+# Run the JS file setup
+ensure_js_files()
+
+#------------------------------------------------------------------------------
+# Section 3: Node Imports
 #------------------------------------------------------------------------------
 # Text Processing Nodes
 from .nodes.ht_regex_node import HTRegexNode
@@ -93,7 +132,7 @@ from .nodes.ht_diffusion_loader_multi import HTDiffusionLoaderMulti
 from .nodes.ht_gemini_node import HTGeminiNode
 
 #------------------------------------------------------------------------------
-# Section 3: Node Registration
+# Section 4: Node Registration
 #------------------------------------------------------------------------------
 # Create an alias for the resolution downsample node to maintain backward compatibility
 HTDownsampleNode = HTResolutionDownsampleNode
@@ -239,19 +278,12 @@ except ImportError:
     print("Intel OIDN not available - denoising node disabled")
 
 #------------------------------------------------------------------------------
-# Section 4: Exports
+# Section 5: Web Directory Export
 #------------------------------------------------------------------------------
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+# Ensure ComfyUI can find our web directory
+def get_custom_web_directories():
+    """Export the web directory for ComfyUI to find our JavaScript"""
+    return [WEB_DIRECTORY]
 
-#------------------------------------------------------------------------------
-# Section 5: Web UI Setup
-#------------------------------------------------------------------------------
-# Create web directory if it doesn't exist
-web_dir = os.path.join(EXTENSION_DIR, "web")
-js_dir = os.path.join(web_dir, "js")
-
-if not os.path.exists(js_dir):
-    try:
-        os.makedirs(js_dir, exist_ok=True)
-    except Exception as e:
-        print(f"Warning: Could not create web directories: {e}")
+# Export all required symbols
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'get_custom_web_directories']
