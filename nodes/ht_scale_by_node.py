@@ -1,12 +1,12 @@
 """
 File: homage_tools/nodes/ht_scale_by_node.py
 Description: Node for scaling images by a factor with mask support
-Version: 1.0.0
+Version: 1.0.1
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List, Union
 import math
 import logging
 
@@ -15,7 +15,7 @@ logger = logging.getLogger('HommageTools')
 #------------------------------------------------------------------------------
 # Section 1: Constants and Configuration
 #------------------------------------------------------------------------------
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 #------------------------------------------------------------------------------
 # Section 2: Helper Functions
@@ -283,6 +283,36 @@ def create_empty_mask(batch_size: int, height: int, width: int, device: torch.de
     """Create empty mask tensor with correct dimensions."""
     return torch.zeros((batch_size, height, width), device=device)
 
+def normalize_input(image_input: Union[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:
+    """
+    Normalize input to a standard tensor format, handling both tensor and list formats.
+    
+    Args:
+        image_input: Either a tensor or a list of tensors
+        
+    Returns:
+        torch.Tensor: Normalized tensor in BHWC format
+    """
+    # Handle list of tensors
+    if isinstance(image_input, list):
+        if not image_input:
+            # Empty list - create a small blank tensor
+            return torch.zeros(1, 8, 8, 3)
+            
+        # Try to stack tensors if they have consistent shapes
+        first_shape = image_input[0].shape
+        if all(t.shape == first_shape for t in image_input):
+            stacked = torch.cat(image_input, dim=0)
+            print(f"Stacked {len(image_input)} tensors into shape {stacked.shape}")
+            return stacked
+        else:
+            # Inconsistent shapes - use just the first tensor
+            print(f"WARNING: Inconsistent tensor shapes in list, using first tensor of shape {first_shape}")
+            return image_input[0]
+    
+    # Regular tensor - just return it
+    return image_input
+
 #------------------------------------------------------------------------------
 # Section 4: Node Definition
 #------------------------------------------------------------------------------
@@ -330,7 +360,7 @@ class HTScaleByNode:
 
     def scale_by_factor(
         self,
-        image: torch.Tensor,
+        image: Union[torch.Tensor, List[torch.Tensor]],
         scale_factor: float,
         interpolation: str,
         crop_to_mask: bool,
@@ -339,14 +369,13 @@ class HTScaleByNode:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scale image and mask by factor."""
         print(f"\nHTScaleByNode v{VERSION} - Processing")
-        print(f"Input tensor shape: {image.shape}, dtype: {image.dtype}")
-        print(f"Scale factor: {scale_factor}, Interpolation: {interpolation}")
-        print(f"Crop to mask: {crop_to_mask}")
-        
-        if mask is not None:
-            print(f"Mask tensor shape: {mask.shape}, dtype: {mask.dtype}")
         
         try:
+            # Handle different input formats - could be tensor or list
+            if isinstance(image, list):
+                print(f"Input is a list of {len(image)} tensors")
+                image = normalize_input(image)
+            
             # Verify input image tensor
             batch, height, width, channels = verify_tensor_dimensions(image, "Input image")
             print(f"Image value range: min={image.min().item():.3f}, max={image.max().item():.3f}")
@@ -444,8 +473,8 @@ class HTScaleByNode:
             return (result_image, result_mask)
             
         except Exception as e:
+            logger.error(f"[CRITICAL ERROR] in image scaling: {str(e)}")
             print(f"[CRITICAL ERROR] in image scaling: {str(e)}")
-            print(f"[DEBUG] Error type: {e.__class__.__name__}")
             import traceback
             traceback.print_exc()
             
@@ -453,9 +482,18 @@ class HTScaleByNode:
             print(f"[DEBUG] Attempting to return valid tensors despite error...")
             try:
                 # Create safe outputs
-                if len(image.shape) == 4:
+                if isinstance(image, torch.Tensor) and len(image.shape) == 4:
                     batch_size = image.shape[0]
                     # Create a small but valid output tensor
+                    safe_image = torch.zeros(batch_size, 64, 64, 3)
+                    safe_mask = torch.zeros(batch_size, 64, 64)
+                elif isinstance(image, list) and len(image) > 0 and isinstance(image[0], torch.Tensor):
+                    # Use dimensions from first tensor in list
+                    first_tensor = image[0]
+                    if len(first_tensor.shape) == 4:
+                        batch_size = first_tensor.shape[0]
+                    else:
+                        batch_size = 1
                     safe_image = torch.zeros(batch_size, 64, 64, 3)
                     safe_mask = torch.zeros(batch_size, 64, 64)
                 else:
@@ -467,5 +505,5 @@ class HTScaleByNode:
             except:
                 # Last resort
                 print(f"[DEBUG] Using original tensors as fallback")
-                empty_mask = torch.zeros(1, image.shape[1], image.shape[2])
-                return (image, empty_mask if mask is None else mask)
+                empty_mask = torch.zeros(1, 64, 64)
+                return (torch.zeros(1, 64, 64, 3), empty_mask if mask is None else mask)
