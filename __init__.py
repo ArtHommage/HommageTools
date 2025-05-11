@@ -1,6 +1,6 @@
 """
 File: homage_tools/__init__.py
-Version: 1.3.1
+Version: 1.3.3
 Description: Initialization file for HommageTools node collection
 """
 
@@ -63,6 +63,15 @@ def ensure_js_files():
             shutil.copy2(seed_js_src, seed_js_dest)
             print(f"Updated HT Seed Advanced UI JavaScript")
 
+    # Copy the dynamic switch UI JavaScript file
+    dynamic_switch_js_src = os.path.join(EXTENSION_DIR, "web", "js", "ht_dynamic_switch_node.js")
+    dynamic_switch_js_dest = os.path.join(JS_DIRECTORY, "ht_dynamic_switch_node.js")
+
+    if os.path.exists(dynamic_switch_js_src):
+        if not os.path.exists(dynamic_switch_js_dest) or os.path.getmtime(dynamic_switch_js_src) > os.path.getmtime(dynamic_switch_js_dest):
+            shutil.copy2(dynamic_switch_js_src, dynamic_switch_js_dest)
+            print(f"Updated HT Dynamic Switch UI JavaScript")
+            
 # Run the JS file setup
 ensure_js_files()
 
@@ -80,6 +89,7 @@ from .nodes.ht_surface_blur_node import HTSurfaceBlurNode
 from .nodes.ht_photoshop_blur_node import HTPhotoshopBlurNode
 from .nodes.ht_moire_removal_node import HTMoireRemovalNode
 from .nodes.ht_levels_node import HTLevelsNode
+from .nodes.ht_image_adjuster_node import HTImageAdjusterNode
 
 # Image Resizing and Dimension Nodes
 from .nodes.ht_resize_node import HTResizeNode
@@ -94,6 +104,9 @@ from .nodes.ht_training_size_node import HTTrainingSizeNode
 from .nodes.ht_mask_dilation_node import HTMaskDilationNode
 from .nodes.ht_multi_mask_dilation_node import HTMultiMaskDilationNode
 from .nodes.ht_mask_validator_node import HTMaskValidatorNode
+
+# Pose Processing Nodes
+from .nodes.ht_dwpose_constraint_node import HTDWPoseConstraintNode
 
 # Seed and Sampling Nodes
 from .nodes.ht_seed_node import HTSeedNode
@@ -149,6 +162,7 @@ NODE_CLASS_MAPPINGS = {
     "HTPhotoshopBlurNode": HTPhotoshopBlurNode,
     "HTMoireRemovalNode": HTMoireRemovalNode,
     "HTLevelsNode": HTLevelsNode,
+    "HTImageAdjusterNode": HTImageAdjusterNode,
     
     # Image Resizing and Dimension
     "HTResizeNode": HTResizeNode,
@@ -164,6 +178,9 @@ NODE_CLASS_MAPPINGS = {
     "HTMaskDilationNode": HTMaskDilationNode,
     "HTMultiMaskDilationNode": HTMultiMaskDilationNode,
     "HTMaskValidatorNode": HTMaskValidatorNode,
+    
+    # Pose Processing
+    "HTDWPoseConstraintNode": HTDWPoseConstraintNode,
     
     # Seed and Sampling
     "HTSeedNode": HTSeedNode,
@@ -215,6 +232,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HTPhotoshopBlurNode": "HT Photoshop Blur",
     "HTMoireRemovalNode": "HT Moiré Removal",
     "HTLevelsNode": "HT Levels",
+    "HTImageAdjusterNode": "HT Image Adjuster",
     
     # Image Resizing and Dimension
     "HTResizeNode": "HT Smart Resize",
@@ -230,6 +248,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HTMaskDilationNode": "HT Mask Dilate",
     "HTMultiMaskDilationNode": "HT Multi Mask Dilate",
     "HTMaskValidatorNode": "HT Mask Validator",
+    
+    # Pose Processing
+    "HTDWPoseConstraintNode": "HT DWPose Constraint",
     
     # Seed and Sampling
     "HTSeedNode": "HT Seed",

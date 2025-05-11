@@ -1,6 +1,6 @@
 """
 File: homage_tools/nodes/ht_dynamic_prompt_node.py
-Version: 1.5.0
+Version: 1.6.0
 Description: Dynamic prompt node with enhanced prompt generation capabilities and accurate token limiting
 """
 
@@ -10,6 +10,7 @@ Description: Dynamic prompt node with enhanced prompt generation capabilities an
 from __future__ import annotations
 
 import logging
+import random
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -26,7 +27,7 @@ logger = logging.getLogger('HommageTools')
 #------------------------------------------------------------------------------
 # Section 2: Constants and Configuration
 #------------------------------------------------------------------------------
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 DEFAULT_MAX_TOKENS = 75  # Default token limit for prompt (below 77 to be safe)
 
 #------------------------------------------------------------------------------
@@ -221,6 +222,7 @@ class HTDynamicPromptNode:
       {variations|like|this}, [number:ranges], __wildcards__, etc.
     - Accurate token limiting using CLIP
     - Excludes LORA tags (<tag>) from token counting
+    - Support for float ranges with precision determined by first number
     """
     
     CATEGORY = "HommageTools"
@@ -340,7 +342,7 @@ class HTDynamicPromptNode:
         except (StopIteration, RuntimeError) as e:
             print(f"Resetting prompt generator: {str(e)}")
             try:
-                self._prompts = self._get_context().sample_prompts(current_prompt)
+                self._prompts = self._get_context().sample_prompts(self._current_prompt)
                 result = next(self._prompts)
                 # Handle the same way as above
                 if hasattr(result, 'prompt'):
@@ -352,7 +354,46 @@ class HTDynamicPromptNode:
                 return ""
 
     #--------------------------------------------------------------------------
-    # Section 6: Main Processing Logic
+    # Section 6: Float Range Processing
+    #--------------------------------------------------------------------------
+    def _process_float_ranges(self, prompt: str, seed: int = None) -> str:
+        """
+        Process float ranges in the prompt and replace with random values.
+        
+        Args:
+            prompt: Input prompt string
+            seed: Random seed for reproducibility
+            
+        Returns:
+            str: Prompt with float ranges replaced by random values
+        """
+        if seed is not None:
+            # Create a local random instance with the given seed
+            rand = random.Random(seed)
+        else:
+            # Use the global random instance
+            rand = random
+        
+        # Pattern for float range: [X.Y:Z.W] where X, Y, Z, W are digits
+        pattern = r'\[(\d+\.\d+):(\d+\.\d+)\]'
+        
+        def replacement(match):
+            start = float(match.group(1))
+            end = float(match.group(2))
+            
+            # Determine precision from first number
+            precision = len(match.group(1).split('.')[-1])
+            
+            # Generate random float within range and format with precision
+            value = rand.uniform(start, end)
+            return f"{value:.{precision}f}"
+        
+        # Replace all occurrences of the pattern with random values
+        result = re.sub(pattern, replacement, prompt)
+        return result
+
+    #--------------------------------------------------------------------------
+    # Section 7: Main Processing Logic
     #--------------------------------------------------------------------------
     def generate_prompt(
         self, 
@@ -407,6 +448,9 @@ class HTDynamicPromptNode:
 
             new_prompt = self._get_next_prompt(self._prompts, self._current_prompt)
             
+            # Process float ranges with the same seed
+            new_prompt = self._process_float_ranges(new_prompt, seed)
+            
             # Apply whitespace cleaning to output if requested
             if strip_whitespace == "Yes":
                 new_prompt = clean_whitespace(new_prompt)
@@ -445,13 +489,3 @@ class HTDynamicPromptNode:
             logger.error(f"Error generating prompt: {e}")
             print(f"Error details: {str(e)}")
             return (f"Error: {str(e)}", "Error generating prompt", clip)
-
-
-# Node registration
-NODE_CLASS_MAPPINGS = {
-    "HTDynamicPromptNode": HTDynamicPromptNode
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "HTDynamicPromptNode": "HT Dynamic Prompt"
-}
