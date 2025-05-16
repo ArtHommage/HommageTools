@@ -1,95 +1,102 @@
-// File: homage_tools/web/js/ht_dynamic_switch_node.js
-// Version: 1.1.0
-// Description: UI implementation for HTDynamicSwitchNode with dynamic input handling
+import { app } from "../../../scripts/app.js";
 
-(function() {
-    // Wait for Comfy UI to be ready
-    const waitForComfy = setInterval(function() {
-        if (window.LiteGraph && window.app) {
-            clearInterval(waitForComfy);
-            registerHTDynamicSwitchNode();
-        }
-    }, 200);
+app.registerExtension({
+    name: "Comfy.HTDynamicSwitchNode",
     
-    function registerHTDynamicSwitchNode() {
-        // Register with ComfyUI's extension system if available
-        if (window.app?.registerExtension) {
-            window.app.registerExtension({
-                name: "HT.DynamicSwitch",
-                async beforeRegisterNodeDef(nodeType, nodeData) {
-                    if (nodeData.name === "HTDynamicSwitchNode") {
-                        // Add onConnectionsChange handler for dynamic inputs
-                        const origOnNodeCreated = nodeType.prototype.onNodeCreated;
-                        nodeType.prototype.onNodeCreated = function() {
-                            if (origOnNodeCreated) {
-                                origOnNodeCreated.apply(this, arguments);
-                            }
-                            
-                            // Initialize dynamic input management
-                            this.onConnectionsChange = function(type, index, connected, link_info) {
-                                // Only handle input connections (type === LiteGraph.INPUT)
-                                if (type === 0) {
-                                    // Find inputs that start with "input"
-                                    const inputKeys = Object.keys(this.inputs)
-                                        .filter(key => key.startsWith("input"))
-                                        .map(key => parseInt(key.substring(5)))
-                                        .filter(key => !isNaN(key));
-                                    
-                                    // Find the highest input number
-                                    const maxInputNumber = inputKeys.length > 0 ? Math.max(...inputKeys) : 0;
-                                    
-                                    if (connected) {
-                                        // When a connection is made, add a new input slot if needed
-                                        const nextInputNumber = maxInputNumber + 1;
-                                        this.addInput(`input${nextInputNumber}`, "*");
-                                    }
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name === "HTDynamicSwitchNode") {
+            // Keep track of initialization state
+            let initializing = false;
+            
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function() {
+                // Set initializing flag to prevent loops
+                initializing = true;
+                
+                const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+                
+                // Add initial input if none exists
+                if (!this.inputs || this.inputs.length === 0 || 
+                    !this.inputs.some(input => input.name && input.name.startsWith("input"))) {
+                    this.addInput("input1", "*");
+                }
+                
+                // Reset initializing flag
+                initializing = false;
+                return r;
+            };
+
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+            nodeType.prototype.onConnectionsChange = function(type, index, connected, link_info, output) {
+                // Don't process during initialization to avoid loops
+                if (initializing) {
+                    return onConnectionsChange ? onConnectionsChange.apply(this, arguments) : undefined;
+                }
+                
+                const r = onConnectionsChange ? onConnectionsChange.apply(this, arguments) : undefined;
+                
+                try {
+                    if (type === LiteGraph.INPUT && connected) {
+                        // Find highest input index
+                        let maxInputNum = 0;
+                        for (let i = 0; i < this.inputs.length; i++) {
+                            const input = this.inputs[i];
+                            if (input.name && input.name.startsWith("input")) {
+                                const num = parseInt(input.name.substring(5));
+                                if (!isNaN(num) && num > maxInputNum) {
+                                    maxInputNum = num;
                                 }
-                            };
-                        };
+                            }
+                        }
                         
-                        // Add custom context menu for quick selection
-                        const origGetExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
-                        nodeType.prototype.getExtraMenuOptions = function(_, options) {
-                            if (origGetExtraMenuOptions) {
-                                origGetExtraMenuOptions.apply(this, arguments);
-                            }
-                            
-                            // Add input selection options to context menu
-                            const inputOptions = [];
-                            
-                            for (let i = 0; i < this.inputs.length; i++) {
-                                const input = this.inputs[i];
-                                if (input.name.startsWith("input")) {
-                                    const inputNumber = parseInt(input.name.substring(5));
-                                    if (!isNaN(inputNumber)) {
-                                        inputOptions.push({
-                                            content: `Select Input ${inputNumber}`,
-                                            callback: () => {
-                                                // Find and update the select widget
-                                                for (const widget of this.widgets) {
-                                                    if (widget.name === "select") {
-                                                        widget.value = inputNumber;
-                                                        widget.callback(inputNumber);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                            
-                            // Add submenu if we have input options
-                            if (inputOptions.length > 0) {
-                                options.push({
-                                    content: "Select Input...",
-                                    submenu: inputOptions
-                                });
-                            }
-                        };
+                        // Add a new input if we connected to the highest one
+                        const slotInput = this.inputs[index];
+                        if (slotInput && slotInput.name === `input${maxInputNum}`) {
+                            this.addInput(`input${maxInputNum + 1}`, "*");
+                        }
+                    }
+                } catch (error) {
+                    console.error("Error in HTDynamicSwitchNode onConnectionsChange:", error);
+                }
+                
+                return r;
+            };
+            
+            // Add handling for node configuration loading
+            const configure = nodeType.prototype.configure;
+            nodeType.prototype.configure = function(info) {
+                initializing = true;
+                const r = configure ? configure.apply(this, arguments) : undefined;
+                
+                // Ensure we have at least one input
+                if (!this.inputs || this.inputs.length === 0 || 
+                    !this.inputs.some(input => input.name && input.name.startsWith("input"))) {
+                    this.addInput("input1", "*");
+                }
+                
+                // Make sure we have one more input than the highest connected input
+                let maxInputNum = 0;
+                for (let i = 0; i < this.inputs.length; i++) {
+                    const input = this.inputs[i];
+                    if (input.name && input.name.startsWith("input")) {
+                        const num = parseInt(input.name.substring(5));
+                        if (!isNaN(num) && num > maxInputNum && input.link != null) {
+                            maxInputNum = num;
+                        }
                     }
                 }
-            });
+                
+                // Add one more input slot for the next connection
+                const nextInputExists = this.inputs.some(input => 
+                    input.name && input.name === `input${maxInputNum + 1}`);
+                    
+                if (!nextInputExists && maxInputNum > 0) {
+                    this.addInput(`input${maxInputNum + 1}`, "*");
+                }
+                
+                initializing = false;
+                return r;
+            };
         }
-    }
-})();
+    },
+});

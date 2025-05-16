@@ -1,6 +1,6 @@
 """
 File: homage_tools/__init__.py
-Version: 1.3.3
+Version: 1.3.4
 Description: Initialization file for HommageTools node collection
 """
 
@@ -143,6 +143,7 @@ from .nodes.ht_tensor_info_node import HTTensorInfoNode
 # AI Integration Nodes
 from .nodes.ht_diffusion_loader_multi import HTDiffusionLoaderMulti
 from .nodes.ht_gemini_node import HTGeminiNode
+from .nodes.ht_gemini_image_node import HTGeminiImageNode  # New image-focused Gemini node
 
 #------------------------------------------------------------------------------
 # Section 4: Node Registration
@@ -217,7 +218,8 @@ NODE_CLASS_MAPPINGS = {
     
     # AI Integration
     "HTDiffusionLoaderMulti": HTDiffusionLoaderMulti,
-    "HTGeminiNode": HTGeminiNode
+    "HTGeminiNode": HTGeminiNode,
+    "HTGeminiImageNode": HTGeminiImageNode  # Added new image-focused Gemini node
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -287,7 +289,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     
     # AI Integration
     "HTDiffusionLoaderMulti": "HT Multi Model Loader",
-    "HTGeminiNode": "HT Gemini"
+    "HTGeminiNode": "HT Gemini",
+    "HTGeminiImageNode": "HT Gemini Image"  # Added display name for new node
 }
 
 # Try to conditionally import OIDN if available

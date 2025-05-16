@@ -1,7 +1,7 @@
 """
 File: homage_tools/nodes/ht_dynamic_prompt_node.py
-Version: 1.6.0
-Description: Dynamic prompt node with enhanced prompt generation capabilities and accurate token limiting
+Version: 1.7.0
+Description: Dynamic prompt node with enhanced prompt generation capabilities, accurate token limiting, and float range support
 """
 
 #------------------------------------------------------------------------------
@@ -27,7 +27,7 @@ logger = logging.getLogger('HommageTools')
 #------------------------------------------------------------------------------
 # Section 2: Constants and Configuration
 #------------------------------------------------------------------------------
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 DEFAULT_MAX_TOKENS = 75  # Default token limit for prompt (below 77 to be safe)
 
 #------------------------------------------------------------------------------
@@ -356,16 +356,18 @@ class HTDynamicPromptNode:
     #--------------------------------------------------------------------------
     # Section 6: Float Range Processing
     #--------------------------------------------------------------------------
-    def _process_float_ranges(self, prompt: str, seed: int = None) -> str:
+    def _process_ranges(self, prompt: str, seed: int = None) -> str:
         """
-        Process float ranges in the prompt and replace with random values.
+        Process number ranges in the prompt and replace with random values.
+        Handles both integer ranges [X:Y] and float ranges [X.Y:Z.W].
+        For float ranges, precision is determined by the first number.
         
         Args:
             prompt: Input prompt string
             seed: Random seed for reproducibility
             
         Returns:
-            str: Prompt with float ranges replaced by random values
+            str: Prompt with ranges replaced by random values
         """
         if seed is not None:
             # Create a local random instance with the given seed
@@ -374,10 +376,29 @@ class HTDynamicPromptNode:
             # Use the global random instance
             rand = random
         
-        # Pattern for float range: [X.Y:Z.W] where X, Y, Z, W are digits
-        pattern = r'\[(\d+\.\d+):(\d+\.\d+)\]'
+        # Debug print to check input
+        print(f"Processing ranges in: {prompt}")
         
-        def replacement(match):
+        # Pattern for integer range: [X:Y] where X, Y are digits (must not have decimals)
+        # Using word boundaries and negative lookahead to avoid matching float patterns
+        int_pattern = r'\[(\d+):(\d+)\]'
+        
+        def int_replacement(match):
+            start = int(match.group(1))
+            end = int(match.group(2))
+            
+            # Generate random integer within range
+            value = rand.randint(start, end)
+            print(f"Replaced integer range [{start}:{end}] with {value}")
+            return str(value)
+        
+        # Replace all integer ranges first
+        result = re.sub(int_pattern, int_replacement, prompt)
+        
+        # Pattern for float range: [X.Y:Z.W] where X, Y, Z, W are digits
+        float_pattern = r'\[(\d+\.\d+):(\d+\.\d+)\]'
+        
+        def float_replacement(match):
             start = float(match.group(1))
             end = float(match.group(2))
             
@@ -386,10 +407,15 @@ class HTDynamicPromptNode:
             
             # Generate random float within range and format with precision
             value = rand.uniform(start, end)
+            print(f"Replaced float range [{start}:{end}] with {value:.{precision}f}")
             return f"{value:.{precision}f}"
         
-        # Replace all occurrences of the pattern with random values
-        result = re.sub(pattern, replacement, prompt)
+        # Replace all float ranges
+        result = re.sub(float_pattern, float_replacement, result)
+        
+        # Debug print to check output
+        print(f"After processing ranges: {result}")
+        
         return result
 
     #--------------------------------------------------------------------------
@@ -449,7 +475,7 @@ class HTDynamicPromptNode:
             new_prompt = self._get_next_prompt(self._prompts, self._current_prompt)
             
             # Process float ranges with the same seed
-            new_prompt = self._process_float_ranges(new_prompt, seed)
+            new_prompt = self._process_ranges(new_prompt, seed)
             
             # Apply whitespace cleaning to output if requested
             if strip_whitespace == "Yes":
