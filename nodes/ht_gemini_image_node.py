@@ -1,49 +1,39 @@
 """
 File: homage_tools/nodes/ht_gemini_image_node.py
-Version: 1.0.0
-Description: Gemini-based image generation node with prompt enhancement and style transfer capabilities
+Version: 1.1.0
+Description: Gemini Image Generation node with API support for text-to-image generation
 """
 
-#------------------------------------------------------------------------------
-# Section 1: Imports and Configuration
-#------------------------------------------------------------------------------
 import os
 import torch
 import base64
-import requests
-import json
-import time
-from typing import Dict, Any, Tuple, Optional, List, Union
 from io import BytesIO
 from PIL import Image
 import numpy as np
 import logging
-import google.generativeai as genai
+import traceback
 import folder_paths
+import re
+from typing import Dict, Any, Tuple, Optional, List, Union
+import time
 
 # Configure logging
 logger = logging.getLogger('HommageTools')
 
 # Version tracking
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+# Default models for image generation
+DEFAULT_MODELS = [
+    "gemini-2.0-flash-preview-image-generation",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-1.0-pro"
+]
 
 #------------------------------------------------------------------------------
-# Section 2: Helper Functions
+# Section 1: Helper Functions
 #------------------------------------------------------------------------------
-def is_running_in_colab() -> bool:
-    """
-    Check if the code is running in Google Colab environment.
-    
-    Returns:
-        bool: True if running in Colab, False otherwise
-    """
-    try:
-        import google.colab
-        # Check if the kernel object exists
-        return hasattr(google.colab, '_kernel') or hasattr(google.colab, 'kernel')
-    except ImportError:
-        return False
-
 def get_api_key() -> str:
     """
     Get the Google API key from various sources.
@@ -57,654 +47,437 @@ def get_api_key() -> str:
     # First try environment variables
     api_key = os.environ.get("GOOGLE_API_KEY")
     if api_key:
-        logger.info("API key found in environment variables")
         return api_key
         
     # Then try Colab userdata if available
-    if is_running_in_colab():
-        try:
-            from google.colab import userdata
-            api_key = userdata.get('GOOGLE_API_KEY')
-            if api_key:
-                logger.info("API key found in Colab userdata")
-                return api_key
-            else:
-                logger.warning("API key not found in Colab userdata")
-        except Exception as e:
-            logger.warning(f"Could not access Colab userdata: {str(e)}")
+    try:
+        from google.colab import userdata
+        api_key = userdata.get('GOOGLE_API_KEY')
+        if api_key:
+            return api_key
+    except:
+        pass
     
     # Finally, try loading from file in ComfyUI directory
     try:
         # Get ComfyUI user directory
-        import folder_paths
-        user_dir = folder_paths.get_user_directory()
-        key_file_path = os.path.join(user_dir, "default", "GOOGLE.key")
-        
-        if os.path.exists(key_file_path):
-            with open(key_file_path, 'r') as key_file:
-                api_key = key_file.read().strip()
-                if api_key:
-                    logger.info(f"API key found in file: {key_file_path}")
-                    return api_key
-    except Exception as e:
-        logger.warning(f"Could not read API key from file: {str(e)}")
-    
-    raise ValueError("Google API key not found. Set it in environment variables, Colab userdata, or place it in user/default/GOOGLE.key file.")
-
-def test_api_connectivity(api_key: str) -> Tuple[bool, str]:
-    """
-    Test connectivity to the Gemini API and validate the API key.
-    
-    Args:
-        api_key: Google API key to test
-        
-    Returns:
-        Tuple[bool, str]: Success status and message
-    """
-    try:
-        # Initialize genai with the provided key
-        genai.configure(api_key=api_key)
-        
-        # Try to list models as a connectivity test
-        models = genai.list_models()
-        model_count = len(list(models))
-        
-        return True, f"API connected successfully. Found {model_count} available models."
-    except Exception as e:
-        error_msg = str(e)
-        if "invalid api key" in error_msg.lower():
-            return False, "Invalid API key. Please check your API key configuration."
-        elif "quota" in error_msg.lower():
-            return False, "API quota exceeded. Please check your usage limits."
-        elif "not available" in error_msg.lower():
-            return False, "Gemini API not available in your region."
-        else:
-            return False, f"API connection error: {error_msg}"
-
-def tensor_to_base64(image_tensor: torch.Tensor, high_quality: bool = True) -> Tuple[str, str]:
-    """
-    Convert image tensor to base64 string for API transmission.
-    
-    Args:
-        image_tensor: Image tensor in BHWC format
-        high_quality: Whether to use high quality PNG (True) or JPEG (False)
-        
-    Returns:
-        Tuple[str, str]: Base64 encoded image and mime type
-    """
-    # Ensure tensor is on CPU and convert to numpy
-    tensor = image_tensor.detach().cpu()
-    
-    # Handle different tensor formats - ensure BHWC
-    if len(tensor.shape) == 3:  # HWC format
-        tensor = tensor.unsqueeze(0)  # Add batch dimension -> BHWC
-    elif len(tensor.shape) == 4 and tensor.shape[1] == 3:  # BCHW format
-        tensor = tensor.permute(0, 2, 3, 1)  # Convert to BHWC
-        
-    # Take first image if batch
-    image_data = tensor[0]  # HWC format
-    
-    # Convert to PIL Image
-    if image_data.shape[-1] == 3:  # RGB
-        pil_image = Image.fromarray((image_data * 255).clamp(0, 255).byte().numpy(), 'RGB')
-    elif image_data.shape[-1] == 4:  # RGBA
-        pil_image = Image.fromarray((image_data * 255).clamp(0, 255).byte().numpy(), 'RGBA')
-    elif len(image_data.shape) == 2 or (len(image_data.shape) == 3 and image_data.shape[-1] == 1):  
-        # Grayscale - convert to RGB
-        if len(image_data.shape) == 3:
-            image_data = image_data.squeeze(-1)  # Remove channel dimension
-        pil_image = Image.fromarray((image_data * 255).clamp(0, 255).byte().numpy(), 'L').convert('RGB')
-    else:
-        raise ValueError(f"Unsupported image format with shape {image_data.shape}")
-    
-    # Convert to base64
-    buffered = BytesIO()
-    if high_quality:
-        pil_image.save(buffered, format="PNG")
-        mime_type = "image/png"
-    else:
-        pil_image.save(buffered, format="JPEG", quality=90)
-        mime_type = "image/jpeg"
-        
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    
-    return img_str, mime_type
-
-def initialize_genai(api_key: str) -> None:
-    """
-    Initialize the Gemini API with the provided key.
-    
-    Args:
-        api_key: Google API key
-    """
-    genai.configure(api_key=api_key)
-
-def get_available_models() -> List[str]:
-    """
-    Get list of available Gemini models from the API.
-    
-    Returns:
-        List[str]: Names of available models
-    """
-    try:
-        # Get API key and initialize
-        api_key = get_api_key()
-        initialize_genai(api_key)
-        
-        # Get models
-        models = genai.list_models()
-        gemini_models = []
-        
-        # Filter for Gemini models with vision capabilities
-        for model in models:
-            if "gemini" in model.name and hasattr(model, "supported_generation_methods"):
-                supported = model.supported_generation_methods
-                if "generateContent" in supported:
-                    model_name = model.name.split('/')[-1]
-                    gemini_models.append(model_name)
-        
-        if not gemini_models:
-            # Default list of commonly used vision-capable Gemini models
-            return [
-                # Recommended Vision-capable models
-                "gemini-2.5-pro-preview", 
-                "gemini-2.0-pro",
-                "gemini-1.5-pro",
-                "gemini-1.5-flash-preview"
-            ]
-            
-        # Sort models by capability and recency
-        sorted_models = []
-        
-        # Add recommended models first
-        for prefix in ["gemini-2.5-", "gemini-2.0-", "gemini-1.5-"]:
-            for model in sorted([m for m in gemini_models if m.startswith(prefix)], reverse=True):
-                sorted_models.append(model)
-        
-        # Add any remaining models
-        for model in gemini_models:
-            if model not in sorted_models:
-                sorted_models.append(model)
-                
-        return sorted_models
-        
-    except Exception as e:
-        logger.error(f"Error getting available models: {str(e)}")
-        # Default list of vision-capable models
-        return [
-            "gemini-2.5-pro-preview", 
-            "gemini-2.0-pro",
-            "gemini-1.5-pro",
-            "gemini-1.5-flash-preview"
+        user_dir = folder_paths.get_output_directory()
+        parent_dir = os.path.dirname(user_dir)
+        possible_paths = [
+            os.path.join(parent_dir, "GOOGLE.key"),
+            os.path.join(user_dir, "GOOGLE.key"),
+            os.path.join(os.path.dirname(parent_dir), "GOOGLE.key")
         ]
+        
+        for key_file_path in possible_paths:
+            if os.path.exists(key_file_path):
+                with open(key_file_path, 'r') as key_file:
+                    api_key = key_file.read().strip()
+                    if api_key:
+                        return api_key
+    except Exception as e:
+        logger.error(f"Could not read API key from file: {str(e)}")
+    
+    raise ValueError("Google API key not found. Set it in environment variables or place it in GOOGLE.key file.")
 
-def create_default_tensor(height: int = 512, width: int = 512) -> torch.Tensor:
+def base64_to_tensor(base64_str: str) -> torch.Tensor:
     """
-    Create a default placeholder image tensor.
+    Convert base64 encoded image to tensor.
     
     Args:
-        height: Height of the image
-        width: Width of the image
+        base64_str: Base64 encoded image
         
     Returns:
-        torch.Tensor: Placeholder image tensor in BHWC format
+        torch.Tensor: Image tensor in BHWC format
     """
-    # Create a gradient background
-    y = torch.linspace(0, 1, height).view(-1, 1).repeat(1, width)
-    x = torch.linspace(0, 1, width).view(1, -1).repeat(height, 1)
-    
-    # Create RGB channels
-    r = x * 0.8
-    g = y * 0.6
-    b = (1 - x) * (1 - y) * 0.5
-    
-    # Add semi-transparent overlay text markers
-    grid = ((x * 10).floor() + (y * 10).floor()) % 2
-    grid = grid * 0.1 + 0.9  # Make grid subtle
-    
-    # Combine channels with grid overlay
-    r = r * grid
-    g = g * grid
-    b = b * grid
-    
-    # Assemble RGB image and add batch dimension
-    image = torch.stack([r, g, b], dim=2)
-    image = image.unsqueeze(0)  # Add batch dimension -> BHWC
-    
-    return image
+    try:
+        # Decode base64 to bytes
+        image_data = base64.b64decode(base64_str)
+        
+        # Convert to PIL Image
+        image = Image.open(BytesIO(image_data))
+        
+        # Convert to RGB if needed
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        
+        # Convert to numpy array
+        np_array = np.array(image).astype(np.float32) / 255.0
+        
+        # Convert to tensor with batch dimension (BHWC format)
+        tensor = torch.from_numpy(np_array).unsqueeze(0)
+        
+        return tensor
+    except Exception as e:
+        logger.error(f"Error converting base64 to tensor: {str(e)}")
+        # Return a fallback colored tensor
+        fallback = torch.zeros(1, 512, 512, 3)
+        # Add a gradient to make it obvious there was an error
+        h, w = 512, 512
+        for y in range(h):
+            for x in range(w):
+                fallback[0, y, x, 0] = y / h  # Red gradient vertically
+                fallback[0, y, x, 1] = x / w  # Green gradient horizontally
+                fallback[0, y, x, 2] = 0.5    # Blue constant
+        return fallback
 
-def text_to_tensor(text: str, width: int = 512, height: int = 512) -> torch.Tensor:
+def parse_style_prompt(style: str, prompt: str) -> str:
     """
-    Create an image tensor with rendered text.
-    This is a placeholder tensor with embedded text.
+    Parse style and prompt to create a comprehensive image generation prompt.
     
     Args:
-        text: Text to embed in the image
-        width: Width of the image
-        height: Height of the image
+        style: Style for the image
+        prompt: Base prompt
         
     Returns:
-        torch.Tensor: Image tensor with text in BHWC format
+        str: Combined prompt
     """
-    # Create a base gradient image
-    base_tensor = create_default_tensor(height, width)
-    
-    # For actual text rendering, we'd need more complex code using PIL
-    # For now, this is a placeholder that creates a distinctive pattern
-    # based on the text content
-    
-    # Hash the text to create a deterministic pattern
-    text_hash = hash(text) % 1000 / 1000
-    
-    # Modify the base image using the hash
-    modified = base_tensor.clone()
-    
-    # Add some pattern based on text (simple approach)
-    b, h, w, c = modified.shape
-    y_pattern = torch.sin(torch.linspace(0, 10 * np.pi * text_hash, h)).view(-1, 1).repeat(1, w)
-    x_pattern = torch.cos(torch.linspace(0, 10 * np.pi * (1-text_hash), w)).view(1, -1).repeat(h, 1)
-    
-    # Apply pattern to channels differently
-    modified[0, :, :, 0] = 0.7 * modified[0, :, :, 0] + 0.3 * y_pattern
-    modified[0, :, :, 1] = 0.7 * modified[0, :, :, 1] + 0.3 * x_pattern
-    modified[0, :, :, 2] = 0.7 * modified[0, :, :, 2] + 0.3 * (x_pattern * y_pattern)
-    
-    return modified
-
-#------------------------------------------------------------------------------
-# Section 3: Image Generation Modes
-#------------------------------------------------------------------------------
-def enhance_prompt(
-    prompt: str,
-    enhancement_type: str,
-    gemini_model,
-    max_tokens: int = 1000
-) -> str:
-    """
-    Enhance a prompt using Gemini API.
-    
-    Args:
-        prompt: Original prompt
-        enhancement_type: Type of enhancement to apply
-        gemini_model: Initialized Gemini model
-        max_tokens: Maximum tokens in response
-        
-    Returns:
-        str: Enhanced prompt
-    """
-    enhancement_instructions = {
-        "detailed": "Enhance this prompt with vivid details and clear descriptions that would help an AI image generator create a better image. Keep the core theme intact but add visual details, lighting, mood, and style guidance:",
-        "artistic": "Transform this prompt into an artistic concept with specific style references, color palettes, and composition guidance for an AI image generator. Make it suitable for creating a visually striking artwork:",
-        "photorealistic": "Enhance this prompt to generate a photorealistic image. Add details about lighting, camera perspective, depth of field, and realistic elements that would make the image appear like a photograph:",
-        "cinematic": "Transform this prompt into a cinematic scene description with details about framing, lighting, atmosphere, depth, and visual storytelling that would make it appear like a still from a film:",
-        "minimal": "Refine this prompt into a minimal, elegant concept that focuses on simplicity and essential elements while maintaining visual impact:",
-        "surreal": "Transform this prompt into a surreal, dreamlike concept with unexpected juxtapositions, symbolic elements, and unique visual ideas that challenge reality:"
+    style_descriptions = {
+        "photography": "A high-quality, detailed photograph of",
+        "photorealistic": "A photorealistic image of",
+        "digital art": "A detailed digital art piece of",
+        "cartoon": "A colorful cartoon-style illustration of",
+        "3d render": "A high-quality 3D rendered image of",
+        "watercolor": "A delicate watercolor painting of",
+        "oil painting": "An oil painting in the style of a master artist of",
+        "pencil sketch": "A detailed pencil sketch of",
+        "pixel art": "A retro pixel art image of",
+        "fantasy": "A fantasy-style digital painting of",
+        "none": ""
     }
     
-    instruction = enhancement_instructions.get(
-        enhancement_type,
-        "Enhance this prompt with more details to create a better image:"
-    )
+    style_text = style_descriptions.get(style.lower(), "")
     
-    try:
-        response = gemini_model.generate_content(
-            f"{instruction}\n\n{prompt}",
-            generation_config={"max_output_tokens": max_tokens}
-        )
-        
-        if response and hasattr(response, 'text') and response.text:
-            # Clean up the response text
-            enhanced = str(response.text).strip()
-            enhanced = enhanced.replace('</s>', '').replace('<s>', '')
-            return enhanced
-        else:
+    # Combine style and prompt
+    if style_text:
+        # Check if prompt already starts with style text to avoid duplication
+        if prompt.lower().startswith(style_text.lower()):
             return prompt
-    except Exception as e:
-        logger.error(f"Error enhancing prompt: {str(e)}")
+        return f"{style_text} {prompt}"
+    else:
         return prompt
 
-def generate_image_description(
-    image: torch.Tensor,
+#------------------------------------------------------------------------------
+# Section 2: Image Generation Function
+#------------------------------------------------------------------------------
+def generate_image_with_gemini(
     prompt: str,
-    mode: str,
-    gemini_model,
-    max_tokens: int = 1000
-) -> str:
+    api_key: str,
+    model_name: str = "gemini-2.0-flash-preview-image-generation",
+    width: int = 1024,
+    height: int = 1024,
+    style: str = "none"
+) -> Tuple[torch.Tensor, str]:
     """
-    Generate an image description or transformation using Gemini's vision capabilities.
+    Generate an image using the Gemini API.
     
     Args:
-        image: Input image tensor
-        prompt: Text prompt or instruction
-        mode: Processing mode
-        gemini_model: Initialized Gemini model
-        max_tokens: Maximum tokens in response
+        prompt: Text prompt for image generation
+        api_key: Google API key
+        model_name: Name of the Gemini model to use
+        width: Desired image width
+        height: Desired image height
+        style: Image style
         
     Returns:
-        str: Generated text description
+        Tuple[torch.Tensor, str]: Generated image tensor and status message
     """
-    # Convert image to base64 for API
-    img_base64, mime_type = tensor_to_base64(image)
-    
-    # Define mode-specific instructions
-    mode_instructions = {
-        "describe": "Describe this image in vivid detail, focusing on visual elements that would be important for an image generation system:",
-        "analyze": "Analyze this image and create a detailed description that captures its composition, color palette, lighting, subject matter, and style:",
-        "enhance": "Using this image as inspiration, create an enhanced description that builds upon what's visible but makes it more visually striking. Focus on improving aspects like composition, lighting, detail, and style:",
-        "transform": "Transform this image concept into a different style or medium as specified in the prompt while maintaining the core subject matter:",
-        "extend": "Describe what might exist beyond the boundaries of this image, extending the scene in all directions with consistent style and content:"
-    }
-    
-    # Get instruction based on mode
-    base_instruction = mode_instructions.get(mode, "Describe this image in detail:")
-    
-    # Combine with user prompt if provided
-    instruction = f"{base_instruction}\n\n{prompt}" if prompt else base_instruction
-    
     try:
-        # Create multimodal prompt with image and text
-        response = gemini_model.generate_content(
-            [
-                {
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": img_base64
-                    }
-                },
-                instruction
-            ],
-            generation_config={"max_output_tokens": max_tokens}
-        )
+        # Import here to avoid startup errors if package is missing
+        import google.generativeai as genai
+        from google.generativeai.types import HarmCategory, HarmBlockThreshold
         
-        if response and hasattr(response, 'text') and response.text:
-            # Clean up the response text
-            description = str(response.text).strip()
-            description = description.replace('</s>', '').replace('<s>', '')
-            return description
+        # Add AspectRatio to the prompt
+        aspect_ratio = f"{width}:{height}"
+        if not re.search(r'\baspect ratio\b', prompt.lower()):
+            prompt += f", aspect ratio {aspect_ratio}"
+        
+        # Create full prompt with style
+        full_prompt = parse_style_prompt(style, prompt)
+        print(f"Sending prompt to Gemini: {full_prompt[:100]}...")
+        print(f"Using model: {model_name}")
+        
+        # Configure the client
+        genai.configure(api_key=api_key)
+        
+        # Try direct API request (more control over parameters)
+        import requests
+        import json
+            
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+        
+        # Set up safety settings
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
+        
+        data = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": full_prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.4,
+                "topK": 32,
+                "topP": 1,
+                "responseModalities": ["TEXT", "IMAGE"]
+            },
+            "safetySettings": safety_settings
+        }
+        
+        print("Sending API request with responseModalities: TEXT, IMAGE")
+        response = requests.post(url, headers=headers, data=json.dumps(data))
+        
+        if response.status_code != 200:
+            print(f"API Error: Status code {response.status_code}")
+            print(f"Response: {response.text}")
+            return torch.zeros(1, height, width, 3), f"API Error: Status code {response.status_code} - {response.text[:200]}"
+        
+        # Parse the response
+        result = response.json()
+        
+        # Look for image data in the response
+        image_tensor = None
+        text_response = ""
+        
+        if "candidates" in result and result["candidates"]:
+            parts = result["candidates"][0]["content"]["parts"]
+            for part in parts:
+                if "text" in part:
+                    text_response = part["text"]
+                if "inlineData" in part:
+                    inline_data = part["inlineData"]
+                    if inline_data.get("mimeType", "").startswith("image/"):
+                        image_tensor = base64_to_tensor(inline_data["data"])
+                        print(f"Found image data ({inline_data['mimeType']})")
+        
+        if image_tensor is not None:
+            return image_tensor, f"Image generated successfully. {text_response}"
         else:
-            return "Failed to generate description."
+            return torch.zeros(1, height, width, 3), f"No image data in response. Response text: {text_response[:200]}"
+                
     except Exception as e:
-        logger.error(f"Error generating image description: {str(e)}")
-        return f"Error: {str(e)}"
+        error_msg = f"Error generating image: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        return torch.zeros(1, height, width, 3), error_msg
+            
+    except Exception as e:
+        error_msg = f"Error generating image: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        return torch.zeros(1, height, width, 3), error_msg
 
 #------------------------------------------------------------------------------
-# Section 4: Node Class Definition
+# Section 3: Node Class Definition
 #------------------------------------------------------------------------------
 class HTGeminiImageNode:
     """
-    ComfyUI node for generating image descriptions and placeholder images using Google Gemini.
-    Features prompt enhancement, image description, and various image generation modes.
+    ComfyUI node for generating images using Google Gemini API.
+    Supports text to image generation with various styles and parameters.
     """
     
     CATEGORY = "HommageTools/AI"
-    FUNCTION = "process_image"
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING")
-    RETURN_NAMES = ("enhanced_prompt", "placeholder_image", "status")
+    FUNCTION = "generate_image"
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("generated_image", "status")
     
-    # Default models list - will be refreshed when needed
-    _models = None
-    _api_key_status = None
-    _last_connectivity_check = 0
-    _connectivity_check_interval = 300  # 5 minutes
+    # Class-level caching for model list
+    _cached_models = None
+    _models_last_refresh = 0
+    _refresh_interval = 3600  # Refresh model list every hour
     
     def __init__(self):
-        """Initialize the node and check connectivity."""
-        self.check_initial_connectivity()
-    
-    def check_initial_connectivity(self):
-        """Check connectivity and API key validity during initialization."""
-        current_time = time.time()
-        
-        # Only check if haven't checked recently
-        if current_time - self._last_connectivity_check < self._connectivity_check_interval:
-            return
-            
-        try:
-            api_key = get_api_key()
-            success, message = test_api_connectivity(api_key)
-            self._api_key_status = message
-            self._last_connectivity_check = current_time
-            
-            if success:
-                logger.info(f"HTGeminiImageNode initialized successfully: {message}")
-            else:
-                logger.warning(f"HTGeminiImageNode initialization warning: {message}")
-        except Exception as e:
-            self._api_key_status = f"Initialization error: {str(e)}"
-            logger.error(f"HTGeminiImageNode initialization error: {str(e)}")
+        """Initialize the node"""
+        # Ensure models are loaded
+        self.get_available_models(force_refresh=False)
     
     @classmethod
-    def get_model_list(cls):
-        """Get or refresh the model list with vision-capable models."""
-        if not hasattr(cls, '_models') or cls._models is None:
-            # Default list focusing on vision-capable models
-            cls._models = [
-                "gemini-2.5-pro-preview", 
-                "gemini-2.0-pro",
-                "gemini-1.5-pro",
-                "gemini-1.5-flash-preview"
-            ]
+    def get_available_models(cls, force_refresh=False):
+        """Get or refresh the list of available models"""
+        current_time = time.time()
+        
+        # Check if we need to refresh the models list
+        if (cls._cached_models is None or 
+            force_refresh or 
+            (current_time - cls._models_last_refresh) > cls._refresh_interval):
+            
+            print("Loading available Gemini models...")
             try:
-                # Try to update from API without blocking startup
-                api_models = get_available_models()
-                if api_models:
-                    cls._models = api_models
-            except:
-                pass
-        return cls._models
+                # Try to get API key
+                api_key = get_api_key()
+                
+                # Try to get available models from API
+                import google.generativeai as genai
+                genai.configure(api_key=api_key)
+                
+                # List models
+                models = genai.list_models()
+                available_models = []
+                
+                # Filter for appropriate models
+                for model in models:
+                    model_name = model.name.split('/')[-1]
+                    # Look for models that might support image generation
+                    if any(x in model_name.lower() for x in ["gemini", "image", "vision", "flash", "pro"]):
+                        available_models.append(model_name)
+                
+                # If we found models, use them
+                if available_models:
+                    cls._cached_models = available_models
+                    print(f"Found {len(available_models)} models: {', '.join(available_models[:3])}...")
+                else:
+                    # Otherwise use defaults
+                    cls._cached_models = DEFAULT_MODELS
+                    print(f"No models found, using defaults: {', '.join(DEFAULT_MODELS)}")
+                
+            except Exception as e:
+                print(f"Error getting models: {str(e)}")
+                # Fall back to default models
+                cls._cached_models = DEFAULT_MODELS
+            
+            # Update refresh timestamp
+            cls._models_last_refresh = current_time
+        
+        return cls._cached_models
     
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
+        # Available image styles
+        image_styles = [
+            "none",
+            "photography",
+            "photorealistic",
+            "digital art", 
+            "cartoon",
+            "3d render",
+            "watercolor",
+            "oil painting",
+            "pencil sketch",
+            "pixel art",
+            "fantasy"
+        ]
+        
+        # Get cached models or load them if needed
+        available_models = cls.get_available_models()
+        
+        # Put the default model first if it's in the list
+        default_model = "gemini-2.0-flash-preview-image-generation"
+        if default_model in available_models:
+            # Move default to the front
+            available_models = [m for m in available_models if m != default_model]
+            available_models.insert(0, default_model)
+        elif available_models:
+            default_model = available_models[0]
+        else:
+            # Fallback - shouldn't happen since we have DEFAULT_MODELS
+            available_models = DEFAULT_MODELS
+            default_model = DEFAULT_MODELS[0]
+        
         return {
             "required": {
-                "model": (cls.get_model_list(), {
-                    "default": cls.get_model_list()[0]
-                }),
-                "mode": (["prompt_enhancement", "image_description", "style_transfer"], {
-                    "default": "prompt_enhancement",
-                    "description": "Processing mode"
-                }),
-                "enhancement_type": (["detailed", "artistic", "photorealistic", "cinematic", "minimal", "surreal"], {
-                    "default": "detailed",
-                    "description": "Type of enhancement to apply to the prompt"
-                }),
-                "description_mode": (["describe", "analyze", "enhance", "transform", "extend"], {
-                    "default": "describe",
-                    "description": "How to describe or transform the input image"
-                }),
                 "prompt": ("STRING", {
                     "multiline": True,
                     "default": "",
-                    "placeholder": "Enter your prompt or instructions here..."
+                    "placeholder": "Enter your prompt for image generation..."
                 }),
-                "output_width": ("INT", {
-                    "default": 512,
-                    "min": 64,
+                "width": ("INT", {
+                    "default": 1024,
+                    "min": 512,
                     "max": 2048,
                     "step": 8
                 }),
-                "output_height": ("INT", {
-                    "default": 512,
-                    "min": 64,
+                "height": ("INT", {
+                    "default": 1024,
+                    "min": 512,
                     "max": 2048,
                     "step": 8
                 }),
-                "max_tokens": ("INT", {
-                    "default": 1000,
-                    "min": 100,
-                    "max": 8192,
-                    "step": 100
-                })
-            },
-            "optional": {
-                "input_image": ("IMAGE",),
+                "style": (image_styles, {
+                    "default": "none"
+                }),
+                "model": (available_models, {
+                    "default": default_model
+                }),
                 "refresh_models": ("BOOLEAN", {
-                    "default": False
+                    "default": False,
+                    "description": "Refresh the available models list"
                 })
             }
         }
 
-#------------------------------------------------------------------------------
-# Section 5: Processing Logic
-#------------------------------------------------------------------------------
-    def process_image(
+    def generate_image(
         self,
-        model: str,
-        mode: str,
-        enhancement_type: str,
-        description_mode: str,
         prompt: str,
-        output_width: int,
-        output_height: int,
-        max_tokens: int,
-        input_image: Optional[torch.Tensor] = None,
-        refresh_models: bool = False
-    ) -> Tuple[str, torch.Tensor, str]:
+        width: int,
+        height: int,
+        style: str,
+        model: str,
+        refresh_models: bool
+    ) -> Tuple[torch.Tensor, str]:
         """
-        Process image or prompt using Gemini API.
+        Generate an image using the Gemini API.
         
         Args:
-            model: Gemini model to use
-            mode: Processing mode
-            enhancement_type: Type of prompt enhancement
-            description_mode: Type of image description
-            prompt: Text prompt or instruction
-            output_width: Width of output placeholder image
-            output_height: Height of output placeholder image
-            max_tokens: Maximum tokens in response
-            input_image: Optional input image tensor
+            prompt: Text prompt for image generation
+            width: Desired image width
+            height: Desired image height
+            style: Image style
+            model: Model to use for generation
             refresh_models: Whether to refresh the model list
             
         Returns:
-            Tuple[str, torch.Tensor, str]: Enhanced prompt, placeholder image, and status
+            Tuple[torch.Tensor, str]: Generated image tensor and status message
         """
-        print(f"\nHTGeminiImageNode v{VERSION} - Processing request")
-        print(f"Mode: {mode}, Model: {model}")
+        print(f"\nHTGeminiImageNode v{VERSION} - Processing")
+        print(f"Size: {width}x{height}, Style: {style}")
+        print(f"Using model: {model}")
+        print(f"Prompt: '{prompt[:50]}...'")
         
         # Refresh models if requested
         if refresh_models:
             print("Refreshing model list...")
-            self.__class__._models = None
-            self.__class__.get_model_list()
+            self.get_available_models(force_refresh=True)
         
         start_time = time.time()
         
         try:
-            # Get API key and initialize Gemini
+            # Check if prompt is empty
+            if not prompt.strip():
+                return torch.zeros(1, height, width, 3), "Error: Empty prompt"
+            
+            # Get API key
             api_key = get_api_key()
-            if not api_key:
-                placeholder = create_default_tensor(output_height, output_width)
-                return (prompt, placeholder, "Error: No API key found")
-                
-            initialize_genai(api_key)
             
-            # Create the Gemini model
-            gemini_model = genai.GenerativeModel(
-                model_name=model,
-                generation_config={
-                    "max_output_tokens": max_tokens,
-                    "temperature": 0.7
-                }
+            # Generate the image
+            image_tensor, status = generate_image_with_gemini(
+                prompt,
+                api_key,
+                model,
+                width,
+                height,
+                style
             )
-            
-            result_text = ""
-            status_msg = ""
-            
-            # Process based on mode
-            if mode == "prompt_enhancement":
-                # Enhance the prompt
-                print(f"Enhancing prompt with style: {enhancement_type}")
-                result_text = enhance_prompt(
-                    prompt, 
-                    enhancement_type, 
-                    gemini_model, 
-                    max_tokens
-                )
-                
-                # Create a placeholder image based on the enhanced prompt
-                placeholder_image = text_to_tensor(result_text, output_width, output_height)
-                status_msg = f"Prompt enhanced with {enhancement_type} style"
-                
-            elif mode == "image_description" and input_image is not None:
-                # Generate description from input image
-                print(f"Generating image description with mode: {description_mode}")
-                result_text = generate_image_description(
-                    input_image,
-                    prompt,
-                    description_mode,
-                    gemini_model,
-                    max_tokens
-                )
-                
-                # Pass through the input image with some modifications
-                if input_image is not None:
-                    # Create a slightly modified version to show it's been processed
-                    placeholder_image = input_image.clone()
-                    # Add a subtle colored border by adjusting a few pixels around the edge
-                    b, h, w, c = placeholder_image.shape
-                    border_width = max(3, min(w, h) // 50)  # Proportional border width
-                    
-                    # Top and bottom borders
-                    placeholder_image[0, :border_width, :, 0] = 0.7  # Red tint
-                    placeholder_image[0, -border_width:, :, 0] = 0.7
-                    # Left and right borders
-                    placeholder_image[0, :, :border_width, 1] = 0.7  # Green tint
-                    placeholder_image[0, :, -border_width:, 1] = 0.7
-                else:
-                    placeholder_image = create_default_tensor(output_height, output_width)
-                    
-                status_msg = f"Image described with {description_mode} mode"
-                
-            elif mode == "style_transfer" and input_image is not None:
-                # Generate style transfer prompt
-                print("Generating style transfer prompt")
-                result_text = generate_image_description(
-                    input_image,
-                    prompt,
-                    "transform",
-                    gemini_model,
-                    max_tokens
-                )
-                
-                # Create a placeholder image with the style transfer prompt
-                placeholder_image = text_to_tensor(result_text, output_width, output_height)
-                status_msg = "Style transfer prompt generated"
-                
-            else:
-                # Default fallback
-                if not prompt:
-                    prompt = "Generate a detailed, high-quality image"
-                result_text = prompt
-                placeholder_image = create_default_tensor(output_height, output_width)
-                status_msg = "Using default mode with original prompt"
             
             # Calculate elapsed time
             elapsed_time = time.time() - start_time
-            status_msg = f"{status_msg} in {elapsed_time:.2f} seconds"
+            full_status = f"{status} in {elapsed_time:.2f} seconds"
             
-            # Verify output tensor format
-            if len(placeholder_image.shape) != 4:  # Ensure BHWC
-                placeholder_image = placeholder_image.unsqueeze(0)
+            return image_tensor, full_status
             
-            b, h, w, c = placeholder_image.shape
-            print(f"Output tensor: {placeholder_image.shape} (BHWC format)")
-            print(f"Status: {status_msg}")
-            
-            return (result_text, placeholder_image, status_msg)
-                
         except Exception as e:
-            logger.error(f"Error in Gemini Image processing: {str(e)}")
-            
-            # Create placeholder on error
-            placeholder = create_default_tensor(output_height, output_width)
-            
-            # Return original prompt and error status
-            status_msg = f"Error: {str(e)}"
-            return (prompt, placeholder, status_msg)
+            error_msg = f"Error in image generation: {str(e)}"
+            logger.error(error_msg)
+            return torch.zeros(1, height, width, 3), error_msg
 
-#------------------------------------------------------------------------------
-# Section 6: Additional Utility Methods
-#------------------------------------------------------------------------------
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         """Always re-run the node to ensure fresh results."""

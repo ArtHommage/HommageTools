@@ -1,6 +1,6 @@
 """
 File: homage_tools/nodes/ht_save_image_plus.py
-Version: 1.4.1
+Version: 1.4.2
 Description: Enhanced image saving node with integrated Florence2 captioning
 """
 
@@ -15,7 +15,7 @@ from typing import Dict, Any, Tuple, Optional, Union
 
 logger = logging.getLogger('HommageTools')
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 #------------------------------------------------------------------------------
 # Section 1: Helper Functions
@@ -56,6 +56,14 @@ def get_total_pixels(image: torch.Tensor) -> int:
         return image.shape[0] * image.shape[1]  # Height * Width
     else:
         return 0
+
+def get_safe_relative_path(path: str, start: str) -> str:
+    """Get relative path safely across different drives."""
+    try:
+        return os.path.relpath(path, start)
+    except ValueError:
+        # If on different drives, return just the path itself
+        return os.path.basename(os.path.dirname(path))
 
 #------------------------------------------------------------------------------
 # Section 2: Main Node Class
@@ -646,9 +654,12 @@ class HTSaveImagePlus:
                     # Log successful image save
                     print(f"Successfully saved cropped image: {file_path} ({total_pixels} pixels)")
                     
+                    # Use safe relative path function for cross-drive compatibility
+                    subfolder = get_safe_relative_path(output_dir, folder_paths.get_output_directory())
+                    
                     results.append({
                         "filename": os.path.basename(file_path),
-                        "subfolder": os.path.relpath(output_dir, folder_paths.get_output_directory()),
+                        "subfolder": subfolder,
                         "type": "output"
                     })
                     
@@ -716,9 +727,12 @@ class HTSaveImagePlus:
                     # Log successful image save to console
                     print(f"Successfully saved image: {file_path} ({total_pixels} pixels)")
                     
+                    # Use safe relative path function for cross-drive compatibility
+                    subfolder = get_safe_relative_path(output_dir, folder_paths.get_output_directory())
+                    
                     results.append({
                         "filename": os.path.basename(file_path),
-                        "subfolder": os.path.relpath(output_dir, folder_paths.get_output_directory()),
+                        "subfolder": subfolder,
                         "type": "output"
                     })
                     
